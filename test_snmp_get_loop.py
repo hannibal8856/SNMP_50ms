@@ -90,38 +90,40 @@ async def send_snmp_request(oids_column=monitor_oids_column, is_per_port=True):
 
         return full_oid_list
 
-    with SnmpDispatcher() as snmpDispatcher:
-        
-        for port_index in range(max_port):
-        
-            all_oids_for_one_port_to_get = combine_oid_tuple(oids_column, is_per_port, port_index + 1)
+    snmpDispatcher = SnmpDispatcher()
 
-            iterator = await get_cmd(
-                snmpDispatcher,
-                CommunityData(community, mpModel=test_snmp_version),
-                await UdpTransportTarget.create((target, snmp_port), timeout=2, retries=0),
-                *all_oids_for_one_port_to_get,
-            )
+    for port_index in range(max_port):
 
-            errorIndication, errorStatus, errorIndex, varBinds = iterator
+        all_oids_for_one_port_to_get = combine_oid_tuple(oids_column, is_per_port, port_index + 1)
 
-            if errorIndication:
-                print(errorIndication)
+        iterator = await getCmd(
+            snmpDispatcher,
+            CommunityData(community, mpModel=test_snmp_version),
+            await UdpTransportTarget.create((target, snmp_port), timeout=2, retries=0),
+            *all_oids_for_one_port_to_get,
+        )
 
-            elif errorStatus:
-                print(
-                    "{} at {}".format(
-                        errorStatus.prettyPrint(),
-                        errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
-                    )
+        errorIndication, errorStatus, errorIndex, varBinds = iterator
+
+        if errorIndication:
+            print(errorIndication)
+
+        elif errorStatus:
+            print(
+                "{} at {}".format(
+                    errorStatus.prettyPrint(),
+                    errorIndex and varBinds[int(errorIndex) - 1][0] or "?",
                 )
-            else:
-                for varBind in varBinds:
-                    print(" = ".join([x.prettyPrint() for x in varBind]))
+            )
+        else:
+            for varBind in varBinds:
+                print(" = ".join([x.prettyPrint() for x in varBind]))
 
-            # Only execute once if not per-port OID
-            if is_per_port == False:
-                break
+        # Only execute once if not per-port OID
+        if is_per_port == False:
+            break
+
+    snmpDispatcher.transportDispatcher.closeDispatcher()
 
 def print_test_parameters():
     #print initial test parameters
