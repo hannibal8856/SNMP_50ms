@@ -401,7 +401,143 @@ sort -n /tmp/snmp_lat.txt | awk '{a[NR]=$1} END {
   - `lib_moxa_rust_iss/src/get_snmp_data.rs`,我們之前改的版本
 - Vincent 2026 PDF Tier 3「in-process cache」:跟方案 C 同精神
 
+---
+
+## 7. 方案 A 上線驗證(2026-08-03)— **A 有 cross-process 缺陷,已造成 production regression**
+
+> 本節推翻 §2.1「半天搞定」與 §3「B 只在需要 sub-second sync 時才做」兩個結論。
+> §2.1 風險段落講的「~5 s dump 週期落後」也不成立 —— 實測 `.stat` 是 on-demand 寫的,
+> 根本沒有 polling 週期。
+
+### 7.1 A 的實作狀態
+
+兩個 repo 都已 commit 在 branch `snmp-plan-E2`:
+
+| repo | commit | 內容 |
+|---|---|---|
+| `app_moxa_fiber_check` | `43138ba` "Act A: Quick win" | 加 `FiberCheck_IsPortLinkUp()`;`_OutputStatus()` 輸出 `linkStatus.%u` |
+| `app_moxa_fiber_check` | `630a991` "Bug fix" | 把 `gIsPortLinkUp[]` 定義從 `fiber_check_main.c` 搬到 `fiber_check_shm_api.c` |
+| `plugin_moxa_fiber_check` | `d277473` "Act A: Quick win" | `status.rs` 移除 `get_snmp_data_by_cli(ifTable)`(-33/+7),改讀 `linkStatus.{i}` |
+
+`630a991` 的動機是 link error:`libmoxa_fiber_check.so` 只由 `shm_api.o / ddm.o /
+defines.o / api.o` 組成,不含 `main.o`,所以 `43138ba` 讓 `.so` 連不起來。搬家解了
+link error,但也讓 daemon 那份跟 dumper 那份徹底分家。
+
+### 7.2 根因:`gIsPortLinkUp[]` 是 process-local,dumper 跟 daemon 不同 process
+
+`.so` 裡的 global 不會跨 process 共享 —— 每個 map 它的 process 拿到自己一份歸零的 copy。
+DUT 上實測(`/proc/*/maps`):
+
+```
+/proc/1087 fiber_check        ← daemon,唯一被 ISS event 更新的那份,但不 map .so
+/proc/1227 app_moxa_framew    ← 實際跑 _OutputStatus() 的 process,它那份永遠 {false}
+/proc/1302 snmpd
+/proc/299  ISS.exe
+```
+
+daemon 的 Makefile 是把 `fiber_check_shm_api.o` 直接連進 `fiber_check` 執行檔,不是連 `.so`。
+系統裡因此有**四份互不相干的 `gIsPortLinkUp[]`**。
+
+寫 `.stat` 的是讀取方,不是 daemon:`status.rs:125` `get_status()` 第一行就呼
+`mx_fiberCheck::output_shared_info()`。實測 `.stat` mtime 隨 `snmpget` 同秒跳動
+(`1683046664 → 1683046739`),全 dl 樹 grep `FiberCheckShm_OutputShmInfo` 也確認
+daemon 一次都沒呼叫。
+
+### 7.3 End-to-end 證據(DUT 192.168.127.253,eth1/1 插 SFP-1GLSXLC-T 且 link up)
+
+| 來源 | 欄位 | 值 |
+|---|---|---|
+| `ifOperStatus.1` | 實際 link | **1 (up)** |
+| `.stat` | `linkStatus.0` | **2 (down)** ← 錯 |
+| `.stat` | `modelName.0` | `SFP-1GLSXLC-T` |
+| `.stat` | `txPower.0` | `-2.99` |
+| `.stat` | **`rxPower.0`** | **`-1.92`** ← 值就在檔案裡 |
+| SNMP col8 | `fiberCheckStatTxPower.1` | `-2.99` ✅ |
+| SNMP col13 | `rxPowerLimit.1` | `[-19.00, -1.00]` ✅ |
+| SNMP col9 | **`fiberCheckStatRxPower.1`** | **`N/A`** ❌ |
+
+`.stat` 裡 `rxPower.0=-1.92` 是好的,是 `status.rs:58` 的 `if port_valid && link_up`
+把它丟掉換成 `"N/A"`。`linkStatus` 讀不到時 `.unwrap_or(false)` 是 fail-closed。
+
+**影響範圍精確到一個 object**:`fiberCheckStatRxPower`。所有不經過這個 gate 的欄位
+(modelName / serialNumber / wavelength / temperature / voltage / txPower /
+txBiasCurrent / 各種 Limit)都直接取自 SHM,正常。A 之前(走 ifTable 那版)是正確的。
+
+SNMP 欄位對照(踩過的坑):col7=voltage、**col8=txPower、col9=rxPower**、col12/13=
+txPowerLimit/rxPowerLimit(2 元素陣列)。§5 驗證腳本裡的 `...1.1.1.8.1` 是 txPower 不是
+rxPower。
+
+### 7.4 決策:B 從「optional 加速」改為「修 A 的必要工作」,範圍縮小
+
+不採用的做法:
+
+- **回退 A**(revert 三個 commit):會把 5–25 ms 的 ifTable call 加回來。既然 B 只要
+  1–2 天,沒有理由先回退再重做。
+- **在 framework process 內另外取得 link status**(例如讀 `/sys/class/net/*/operstate`
+  或保留 ifTable call):等於繞回 A 想解決的問題,而且 fiber 邏輯 port 跟 netdev 不是
+  一對一。
+- **新開一塊 SHM segment + 專用 Rust binding crate**(文件 §2.2 原本估 2 週的做法):
+  現成的 `kShmSrvBlkTypeFiberCheckStatusSrv` 已經在跨 process 傳同一份 port status,
+  多開一塊沒有好處。
+
+採用:把 link status 放進**既有**的 status SHM。
+
+1. `include/fiber_check_monitor.h:21` `struct FiberCheckPortStatus` 加 `bool mLinkUp`
+2. daemon 在 `fiber_check_main.c:444`(ISS event)、`:961`(startup init)更新
+   `gIsPortLinkUp[]` 的同時寫進 SHM
+3. `fiber_check_shm_api.c:_OutputStatus()` 改讀
+   `aFiberCheckStatus->mPortStatus[port].mLinkUp`;`gIsPortLinkUp[]` 與
+   `FiberCheck_IsPortLinkUp()` 連同 `630a991` 搬家的那段一併移除
+4. `status.rs` **不動**(它讀 `.stat` 的介面不變)
+
+副作用:同步變即時,§2.1 原本擔心的 dump 落後問題連同「dump 週期」這個錯誤前提一起消失。
+
+### 7.5 ABI 相依性查證:ISS 不受影響,B 可單獨出版
+
+| 檢查 | 結果 |
+|---|---|
+| 誰 include `fiber_check_monitor.h`(struct 所在) | 只有 `app_moxa_fiber_check` 自己的 monitor / shm_api / main 三個 `.c`,全 dl 樹無他人 |
+| Makefile 對外安裝的 header | 只有 `fiber_check_api.h`,**不含** `FiberCheckStatus` / `FiberCheckPortStatus` |
+| ISS 實際用到的 API | `FiberCheck_CheckEeprom / CheckVendorName / GetModelName / InitFiberEvent / NotifyFiberEvent`,均不碰 struct |
+| ISS 有無引用 SHM key | `grep kShmSrvBlkTypeFiberCheckStatusSrv app_moxa_iss_10_1_0/` → 零命中 |
+| SHM size 怎麼決定 | `fiber_check_main.c:912` `LibUtil_ShmCreate(..., sizeof(struct FiberCheckStatus))`,daemon 執行時決定 |
+
+會 memcpy 這個 struct 的程式碼全部出自 `app_moxa_fiber_check` 同一次 build(daemon 執行檔
++ `.so`),必然同版本一起出。**不需要跟 ISS 同步升版。**
+
+唯一注意事項:`shmget` 用既有 key 但更大 size 會回 EINVAL。正常韌體升級會 reboot、segment
+消失所以沒問題;**熱換 binary 不重開機**的測試流程會踩到,要記得重開。
+
+### 7.6 B 的驗收條件
+
+沿用 7.3 的環境:
+
+```bash
+# eth1/1 link up 時
+/usr/bin/snmpget -v2c -c public 192.168.127.253 .1.3.6.1.4.1.8691.603.5.3.2.1.1.1.9.1
+# 預期:STRING: "-1.92"(或當下實際值),不是 "N/A"
+
+# DUT 上對照
+grep -E '^(linkStatus|rxPower)\.0=' /etc/moxa/app-moxa-fiber-check/fiberCheck.stat
+# 預期:linkStatus.0=1  rxPower.0=-1.92
+
+# 拔線後
+# 預期:linkStatus.0=2,SNMP col9 回 "N/A"
+```
+
+### 7.7 對方案 C 的影響
+
+無。C 讓 daemon 直接在自己 process 內讀 link status + status struct,本來就繞過這整個
+cross-process 問題。B 是 C 落地前的過渡,兩者不衝突;C 上線後 `_OutputStatus()` 仍
+保留給 REST/web UI 用。
+
+---
+
 ## Changelog
 
 - 2026-06-02:從 status.rs trace 發現 ifTable 重量級 call 只為 link up/down 判斷。
   整理三方案(A 短期 / B 中期 / C 長期跟 AgentX PoC 整合)。
+- 2026-08-03:A 上線驗證,發現 `gIsPortLinkUp[]` 是 process-local 而 `.stat` dumper
+  跑在 framework process,導致 `fiberCheckStatRxPower` 恆為 "N/A"(regression)。
+  查證 ISS 無 SHM ABI 相依。B 改為必要工作,範圍縮小為「既有 status SHM 加
+  `bool mLinkUp`」。詳見 §7。
