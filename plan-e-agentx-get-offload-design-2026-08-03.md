@@ -533,6 +533,15 @@ dlmod plugin 對 framework 的呼叫統計：`/api/v1/setting` 321 次、`/api/v
 
 **GET 側完全不碰 command layer**，不需特殊處理。
 
+dlmod 的載入是執行期決定的：每支 plugin 安裝一個 `.conf` 到 `/etc/moxa/netsnmp/config/`，
+`setup_snmpd_plugin_conf()`（`config_moxa_snmp_control.c:393`）以
+`find <該目錄> -name '*.conf'` 組出逗號清單餵給 `snmpd -c`。
+因此載入集合 = 安裝集合 = `BR2_PACKAGE_PLUGIN_MOXA_*`，隨型號而異（見 §9.2 的產品相依性警告）。
+
+**同一 arc 可能由多支 plugin 分佔**：`8691.603.4.10`（mxLp）同時被 `plugin_moxa_lp`
+與 `plugin_moxa_iec62439_2/snmp/status`（`sMxLpStatusOid = 8691.603.4.10.2`）服務。
+Phase 7 拆分時這類共用 arc 要一起處理，不能各自為政。
+
 ### 8.2 三層障礙
 
 1. **mapping 不在 `net_*.h`**：在各 plugin 的 `LibSnmpPlugin_OidColumn[] / OidScalar[]` 宣告表
@@ -613,19 +622,30 @@ ISS 端共 **37 個** Moxa private MIB root（掃描 `code/future/**/mx*db.h` �
 | `8691.602.2.3` | mxDhcpRelay | `plugin_moxa_dhcp_relay` |
 | `8691.602.3.4` | mx1588 | `plugin_moxa_ptp` |
 | `8691.603.3.8` | mxMcp | `plugin_moxa_multicoupling` |
-| `8691.603.4.10` | mxLp | `plugin_moxa_lp` |
+| `8691.603.4.10` | mxLp | `plugin_moxa_lp` **＋** `plugin_moxa_iec62439_2/snmp/status`（`sMxLpStatusOid = 8691.603.4.10.2`）—— 同一 arc 由兩支 plugin 分佔不同子節點 |
 | `8691.603.4.12` | mxIpsg | `plugin_moxa_ipsg` |
 | `8691.603.4.13` | mxDai | `plugin_moxa_dai` |
 | `8691.603.5.8` | mxGc | `plugin_moxa_goose_check` |
 | `8691.605.4.1` | mxMR | `plugin_moxa_multicast_routing` |
-| `8691.603.3.9` | mxPhr | **掃描未找到** |
-| `8691.603.3.10` | mxSup | **掃描未找到** |
-| `8691.603.3.12` | mxMrp | **掃描未找到** |
-| `8691.603.4.7` | mxAcl | **掃描未找到** |
-| `8691.603.4.15` | mxVa | **掃描未找到** |
+| `8691.603.3.9` | mxPhr | **無主**（無 `plugin_moxa_phr` 目錄） |
+| `8691.603.3.10` | mxSup | **無主**（無 `plugin_moxa_supervision` 目錄） |
+| `8691.603.3.12` | mxMrp | **無主**（`plugin_moxa_iec62439_2` 註冊的是 `1.0.62439.1.1` IEC 標準 MRP MIB，非 mxMrp） |
+| `8691.603.4.7` | mxAcl | **無主**（`plugin_moxa_acl` 存在但無 `snmp/` 目錄，僅 cli/command/framework/python） |
+| `8691.603.4.15` | mxVa | **無主**（無 `plugin_moxa_va` 目錄） |
 
-> 掃描方法為比對 plugin `.c` 內的字面 OID 陣列；若某 plugin 以組合方式建構 OID 會被漏掉。
-> 後 5 項需人工確認（`plugin_moxa_iec62439_2` 存在但未掃到 mxMrp arc，特別值得看）。
+後 5 項以兩種方法確認：(1) 檢查是否存在對應 plugin 目錄與其 `snmp/` 子目錄；
+(2) 全域搜尋 `8691,603,{4,7|3,9|3,10|4,15}` 等 arc，在 ISS 之外零命中。
+
+> **這張表是產品相依的。** dlmod 的載入清單不是編譯期靜態決定，而是
+> `setup_snmpd_plugin_conf()`（`config_moxa_snmp_control.c:393`）在執行期以
+> `find /etc/moxa/netsnmp/config/ -name '*.conf'` 動態組出，餵給 `snmpd -c <list>`。
+> 因此「誰服務這個 root」= 「哪些 plugin 實際被安裝」= `BR2_PACKAGE_PLUGIN_MOXA_*`。
+>
+> 本表依 MDS-G4000-L3-4XGS 的 `buildroot/.config` 判定，前 10 項對應的
+> `BR2_PACKAGE_PLUGIN_MOXA_{EIP,PROFINET,DHCP_RELAY,PTP,MULTICOUPLING,LP,IPSG,DAI,GOOSE_CHECK,MULTICAST_ROUTING}`
+> 全部為 `=y`。**換型號（EDS / TN / MRX）若某些 plugin 未開啟，對應的 ISS root
+> 就從「被 dlmod 蓋住」變成「無主」，OID 將直接由 ISS 回答。**
+> 每個要出貨的型號都必須重跑這份比對。
 
 #### 兩個實質影響
 
@@ -743,7 +763,8 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | framework subagent 的批次取值 | value-file 的「一次取整張表」語意是否需要在 in-process 重現。取決於 config/status layer 單次查詢成本 |
 | 483 筆溢出的關閉方式 | ISS 端不註冊（優先）vs VACM exclude（備案），逐段評估 |
 | `mxArpdb` 的 `URI_FIXED_VALUE` | `ies_auto_mibs_setup_net_mxArpdb.c` 對 `iss_build==1` 的 entry 設了 `URI_FIXED_VALUE`，但該旗標只在 `entry_handle_generate_uri_value_file()`（framework path，`:2425`）被檢查，ISS path 不看。疑似 dead code 或路由不符預期，Phase 5 遷移該組前須確認 |
-| 5 個無主 ISS root（§9.2） | `mxPhr` / `mxSup` / `mxMrp` / `mxAcl` / `mxVa`：ISS 有 AgentX 註冊、本地無人覆蓋。須人工確認 (1) 是否真的無人服務（掃描只看字面 OID 陣列），(2) 在本產品組態下 ISS 是否確實不回值，(3) 換型號 / 開啟對應 `BR2_MOXA_*` 旗標後的行為。若確認為洩漏，於 Phase 8 以 ISS 端不註冊或 VACM exclude 關閉 |
+| 5 個無主 ISS root（§9.2） | `mxPhr` / `mxSup` / `mxMrp` / `mxAcl` / `mxVa`：ISS 有 AgentX 註冊、本地確認無人覆蓋。私有樹 walk diff = 0 表示目前不回值，但那是 ISS 執行期行為而非結構保證。須確認開啟對應 `BR2_MOXA_*` / ISS 模組後的行為；若確認為洩漏，於 Phase 8 以 ISS 端不註冊或 VACM exclude 關閉 |
+| 逐型號重跑 §9.2 比對 | §9.2 的歸屬表依 MDS-G4000-L3-4XGS 組態判定。dlmod 載入清單由 `BR2_PACKAGE_PLUGIN_MOXA_*` 決定，換型號可能使某些 ISS root 失去本地覆蓋。每個出貨型號都要重跑一次比對並記錄結果 |
 
 ### 12.2 Future Works
 
