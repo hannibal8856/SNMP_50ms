@@ -16,6 +16,8 @@
 - **SET 路徑一行不得更動**：`MODE_IS_SET` 分支、`READ_CREATE_*`、`security_token`、rowStatus 全部維持原狀
 - **不得引入 `ies_uri_handle_client` 或任何檔案式 IPC 到新程式碼**（D15）
 - **不修 `8691.602`→`8691.603` 的 endOfMibView 缺陷**（D16）；基線以各子樹 root 分段擷取
+- **程式碼註解一律使用英文。** 計畫文件、commit message、報告可用中文，
+  但進入原始碼的註解必須是英文
 - 設計文件：`~/WORK/SNMP_50ms/plan-e-agentx-get-offload-design-2026-08-03.md`。
   程式碼註解引用決策時使用 `per D<n>` 格式
 - 每個 task 結束時 commit；C 端的變更 commit 在 `dl/3rdparty_net_snmp`（分支 `snmp-plan-E2`），
@@ -442,22 +444,31 @@ git commit -m "tools: add per-subtree baseline capture; record mainline and plan
 在同一位置寫入：
 
 ```c
-/* GET 轉發（per D4）：in-master 保留註冊以承接 SET，MODE_IS_GET 時把請求交給
- * 覆蓋同一段 OID 的 AgentX subagent。
+/* Forward a GET to an AgentX subagent (per D4).
  *
- * net-snmp 的註冊表是二維的：->next/->prev 依 OID 順序把空間切成互不重疊的區段，
- * ->children 則掛著同一區段上所有重疊的註冊，依 (namelen 由長到短, priority 由小到大)
- * 排序（agent_registry.c 的 netsnmp_subtree_load()）。落敗者不會被丟棄。
- * netsnmp_subtree_split() 以 deepcopy 切割，name_a / namelen / reginfo 原樣保留，
- * 所以 subagent 的廣註冊被本地註冊切開後，切片仍帶原本的 reginfo 掛在 children 上。
+ * in-master keeps its registration so it still owns SET; on MODE_IS_GET the
+ * request is handed to whichever subagent covers the same OID range.
  *
- * 這與 netsnmp_unregister_mib_context()（agent_registry.c:1705）尋找特定註冊的
- * 走訪方式相同，非自創手法。
+ * net-snmp's registration table is two-dimensional. ->next/->prev slice the
+ * OID space into non-overlapping regions in OID order; ->children holds every
+ * overlapping registration for one region, sorted by (namelen descending,
+ * priority ascending) in netsnmp_subtree_load() (agent_registry.c). The losers
+ * are kept, not discarded. netsnmp_subtree_split() splits via deepcopy and
+ * preserves name_a / namelen / reginfo, so when a local registration carves up
+ * a subagent's broad registration, the resulting fragment still carries the
+ * subagent's reginfo and hangs off the children chain.
  *
- * 以 reginfo->rootoid 而非 request 的 OID 定位 subtree：GETNEXT 時 requestvb->name
- * 是「前一個」OID，可能落在別的區段；用自己的註冊根才對 GET 與 GETNEXT 都成立。
+ * This is the same traversal netsnmp_unregister_mib_context() uses to locate a
+ * specific registration (agent_registry.c:1705) - not an invented technique.
  *
- * 回傳 0 = 已交給 subagent；-1 = 無 subagent 覆蓋，呼叫端回落本地慢路徑。 */
+ * The subtree is located via reginfo->rootoid rather than the request's OID:
+ * on GETNEXT, requestvb->name is the *preceding* OID and may fall in a
+ * different region. Using our own registration root is correct for both GET
+ * and GETNEXT.
+ *
+ * Returns 0 when the request was handed to a subagent, -1 when no subagent
+ * covers this OID, in which case the caller falls back to the local slow path.
+ */
 static int
 mox_snmp_forward_get_to_subagent
 (
@@ -498,10 +509,11 @@ mox_snmp_forward_get_to_subagent
 
     if ( NULL == c )
     {
-        return -1;                  /* 無 subagent 覆蓋此 OID */
+        return -1;                  /* no subagent covers this OID */
     }
 
-    /* 只轉發這一筆；不解開 next 會讓 netsnmp_call_handlers 一併拉走整條 chain。 */
+    /* Forward this request only; leaving ->next intact would make
+     * netsnmp_call_handlers pull the whole chain along. */
     saved_next    = request->next;
     request->next = NULL;
     (void) netsnmp_call_handlers(c->reginfo, reqinfo, request);
@@ -548,8 +560,9 @@ mox_snmp_forward_get_to_subagent
 換成：
 
 ```c
-        /* per D2：GET 一律交給 subagent，不分 RO/RW、不看清單。
-         * subagent 未連線或未覆蓋此 OID 時回落下方的本地慢路徑。 */
+        /* per D2: every GET goes to a subagent - no RO/RW distinction, no list.
+         * Falls through to the local slow path below when the subagent is not
+         * connected or does not cover this OID. */
         if ( mox_snmp_forward_get_to_subagent(reginfo, reqinfo, request) == 0 )
         {
             return SNMP_ERR_NOERROR;
@@ -686,8 +699,8 @@ git commit -m "baseline: task3 result (children-chain forwarding)"
 換成：
 
 ```c
-    /* per D1/D2：全部欄位一律本地註冊以承接 SET；GET 由
-       mox_snmp_forward_get_to_subagent() 統一轉給 AgentX subagent。 */
+    /* per D1/D2: every column registers locally so it still owns SET; GET is
+       routed to the AgentX subagent by mox_snmp_forward_get_to_subagent(). */
 ```
 
 - [ ] **Step 4: 移除安裝步驟並刪檔**
@@ -812,12 +825,16 @@ priority**。任何 subagent 只要註冊得比 in-master 細（OID 更長），
 在 `moxa_snmp_handle_util.c` 檔案末端（`#endif` 之前）加入：
 
 ```c
-/* per D4b：subtree 排序鍵是 (namelen 由長到短, priority 由小到大)，namelen 先比。
- * 任何 subagent 若註冊得比 in-master 細，就會搶下 children 鏈頭，使 in-master 的
- * handler 不被呼叫（SET 落到 subagent、GET 轉發不執行）。priority 救不了這種情況。
+/* per D4b: the subtree sort key is (namelen descending, priority ascending),
+ * so namelen is compared first. Any subagent registering at a finer
+ * granularity than in-master takes the head of the children chain, and the
+ * in-master handler stops being called - SET lands on the subagent and GET
+ * forwarding never runs. Lowering in-master's priority cannot prevent this.
  *
- * 不變式：in-master 在每一個 subagent 覆蓋的 OID 範圍上，namelen 必須 >= 該 subagent。
- * 這裡在 subagent 註冊時檢查並記 log，違反時給出可查的線索而非靜默失敗。 */
+ * Invariant: over every OID range a subagent covers, in-master's namelen must
+ * be >= that subagent's. This checks the invariant as subagents register and
+ * logs violations, so the failure leaves a trace instead of silently breaking
+ * writes. */
 int
 moxaSnmpHandle_UtilAgentxRegisterWatch
 (
@@ -835,7 +852,7 @@ moxaSnmpHandle_UtilAgentxRegisterWatch
         return 0;
     }
 
-    /* 只看 AgentX subagent 的註冊 */
+    /* only AgentX subagent registrations are of interest */
     if ( rp->reginfo->handler->access_method != agentx_master_handler )
     {
         return 0;
