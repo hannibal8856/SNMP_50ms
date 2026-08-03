@@ -13,6 +13,11 @@ HOST="${2:?usage: capture_baseline.sh <label> <host> [community]}"
 COMM="${3:-public}"
 OUT="$(dirname "$0")/../snmpwalk/${LABEL}-$(date +%Y%m%d_%H%M)"
 
+# PATH may resolve snmpwalk to the pysnmp/snmpclitools implementation, which
+# crashes partway through a walk. Default to the net-snmp binary; override
+# with SNMPWALK=... if it lives elsewhere.
+SNMPWALK="${SNMPWALK:-/usr/bin/snmpwalk}"
+
 ROOTS=(
     1.3.6.1.2                      # 標準 MIB（mib-2）
     1.3.6.1.4.1.8691.600           # Moxa 600
@@ -25,22 +30,27 @@ ROOTS=(
     1.2.840                        # PROFINET
 )
 
+if ! "$SNMPWALK" --version 2>&1 | grep -q "NET-SNMP"; then
+    echo "!! $SNMPWALK is not the net-snmp binary; set SNMPWALK to the right path" >&2
+    exit 1
+fi
+
 mkdir -p "$OUT"
 rc=0
 for root in "${ROOTS[@]}"; do
     f="${OUT}/${root}.txt"
     echo "walking ${root} ..."
-    snmpwalk -v2c -c "$COMM" -On -Cc "$HOST" "$root" > "$f" 2>&1
+    "$SNMPWALK" -v2c -c "$COMM" -On -Cc "$HOST" "$root" > "$f" 2>&1
     walk_rc=$?
     n=$(grep -c "^\." "$f" 2>/dev/null)
     if [ "$walk_rc" -ne 0 ]; then
         echo "  !! ${root}: snmpwalk 失敗（exit ${walk_rc}）—— 此次擷取無效" >&2
         rc=1
+    elif grep -qE "Timeout: No Response|Traceback \(most recent call last\)|^snmpwalk: " "$f"; then
+        echo "  !! ${root}: 擷取中出現錯誤訊息 —— 此次擷取無效" >&2
+        rc=1
     elif [ "$n" -eq 0 ]; then
         echo "  -- ${root}: 0 OIDs（此裝置未實作此子樹）"
-    elif ! tail -1 "$f" | grep -qE "End of MIB|No more variables"; then
-        echo "  !! ${root}: ${n} OIDs，未正常結束 —— 此次擷取無效" >&2
-        rc=1
     else
         echo "  ok ${root}: ${n} OIDs"
     fi
