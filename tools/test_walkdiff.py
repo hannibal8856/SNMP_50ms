@@ -53,3 +53,18 @@ def test_load_profile_splits_private_and_standard(tmp_path):
     private, standard = load_profile(f)
     assert private == {"mxPort", "mxLa"}
     assert standard == {"IF-MIB", "BRIDGE-MIB"}
+
+
+def test_parse_walk_joins_continuation_lines(tmp_path):
+    f = write(tmp_path, "w.txt", """
+        iso.3.6.1.2.1.1.1.0 = Hex-STRING: 80 00 21 F3 03 00 90 E8
+        BD 1B 8A 00 11 22 33 44
+        iso.3.6.1.2.1.1.2.0 = INTEGER: 7
+        End of MIB
+    """)
+    oids, complete = parse_walk(f)
+    assert oids["1.3.6.1.2.1.1.1.0"] == (
+        "Hex-STRING: 80 00 21 F3 03 00 90 E8 BD 1B 8A 00 11 22 33 44"
+    )
+    assert oids["1.3.6.1.2.1.1.2.0"] == "INTEGER: 7"
+    assert complete is True

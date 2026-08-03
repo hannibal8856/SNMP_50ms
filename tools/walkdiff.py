@@ -15,6 +15,7 @@ def parse_walk(path):
     """Return ({oid: value_text}, completed_normally)."""
     oids = {}
     last = ""
+    last_oid = None
     with open(path, errors="ignore") as fh:
         for line in fh:
             line = line.rstrip("\n")
@@ -22,7 +23,13 @@ def parse_walk(path):
                 last = line.strip()
             m = _LINE.match(line)
             if m:
-                oids["1" + m.group(1)] = m.group(2)
+                oid = "1" + m.group(1)
+                oids[oid] = m.group(2)
+                last_oid = oid
+            elif line.strip() and not any(line.startswith(t) for t in _TERMINATORS):
+                # Continuation line: append to the last OID's value
+                if last_oid is not None:
+                    oids[last_oid] += " " + line.strip()
     return oids, any(last.startswith(t) for t in _TERMINATORS)
 
 
