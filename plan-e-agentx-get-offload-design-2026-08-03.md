@@ -397,8 +397,36 @@ mox_snmp_forward_get_to_subagent(netsnmp_agent_request_info *reqinfo,
 
 - `agentx_master_handler` 宣告於 `agent/mibgroup/agentx/master.h:12`
 - `c->reginfo->handler->myvoid` 是 `netsnmp_session *`（`master_admin.c:230`），可區分 subagent
-- **這是 net-snmp 自己的慣用法**：`netsnmp_unregister_mib_context()`
-  （`agent_registry.c:1705-1719`）用完全相同的 children 走訪找特定註冊
+- **這是 net-snmp 自己的慣用法**：`unregister_mib_context()`
+  （定義於 `agent_registry.c:1687`，走訪迴圈在 `:1714`）用完全相同的 children 走訪找特定註冊
+
+#### subagent 端失敗時的行為（實作驗證後補記）
+
+`agentx_master_handler()` **所有失敗路徑都回 `SNMP_ERR_NOERROR`**，錯誤一律透過
+`netsnmp_set_request_error(reqinfo, requests, SNMP_ERR_GENERR)` 掛在 request 上
+（`master.c:459`：session 不存在；`:512`：PDU 配置失敗）。
+因此轉發時**捨棄 `netsnmp_call_handlers()` 的回傳值是正確的**，錯誤會隨 request 傳回客戶端。
+
+但有一個 net-snmp 既有的縫隙值得記錄（`master.c:617-621`）：
+
+```c
+result = snmp_async_send(ax_session, pdu, agentx_got_response, cb_data);
+if (result == 0) {
+    snmp_free_pdu(pdu);
+}
+return SNMP_ERR_NOERROR;
+```
+
+`snmp_async_send()` 失敗時只釋放 PDU，**沒有設 request error**，而 request 在前面的迴圈中
+已被標記為 delegated。該筆請求因此會懸著直到 agent 逾時，而非立刻回錯或回落。
+
+**這不是 Plan E 引入的**，且本設計相對前案是改善的：
+- Plan C 讓 RO OID 完全不在本地註冊，subagent 一斷線那些 OID 直接從 MIB 樹消失，毫無回落
+- 本設計保留本地註冊，net-snmp 一旦把斷線的 subagent 反註冊，`->children` 就找不到 AgentX 節點，
+  自動回落本地慢路徑
+
+殘留風險僅限「session 已死但尚未被反註冊」的短暫窗口，該窗口內的 GET 會等到逾時而非回落。
+列為已知限制，不在本專案處理範圍。
 
 #### `agentx_owned.list` 廢除
 
@@ -1012,7 +1040,7 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | D1 | `agentx_owned.list` 廢除，改為整段註冊 + 無條件 GET 轉發 | 清單 key（URI 前綴）與路由空間（OID）不對應；`mxLadb` 反例會產生 `noSuchObject`。改成結構性路由後無清單可維護 | (a) 改用 OID 前綴清單：仍需維護且會與 ISS 實際註冊不同步。(b) 保留 URI 清單加 OID 驗證閂：註冊時機早於 AgentX 連線，驗證拿不到結果 |
 | D2 | GET 一律出 snmpd（不分 RO/RW）；SET 一律 in-master | `iss_build==0` 只有 9% 是 RO，「只 offload RO」規則在 framework 側失效 | 桶 B 只收 RO：涵蓋率過低，無實質效益 |
 | D3 | 逐欄位註冊改整段註冊（FRR `register_mib` 風格） | 順帶消滅 §3.3 的 24 張表合成 index 風險，以及 §4.3 的 GETNEXT 邊界風險 | 維持逐欄位並個別修 `GenerateTableIndexEntry`：治標，且 GETNEXT 風險仍在 |
-| D4 | 機制二走 `netsnmp_subtree` 的 `->children` 鏈 | probe-OID 依賴「同區內存在 ISS 獨佔 RO instance」，是每張表的偶然性質，無法通用化。children 走訪是 net-snmp 自己的慣用法（`agent_registry.c:1705`） | (a) 自建 `SNMPD_CALLBACK_REGISTER_OID` 路由表：耦合較黏但多一份狀態要跟 subagent 斷線/重連同步。(b) 沿用 probe-OID：無法規模化 |
+| D4 | 機制二走 `netsnmp_subtree` 的 `->children` 鏈 | probe-OID 依賴「同區內存在 ISS 獨佔 RO instance」，是每張表的偶然性質，無法通用化。children 走訪是 net-snmp 自己的慣用法（`agent_registry.c:1714`） | (a) 自建 `SNMPD_CALLBACK_REGISTER_OID` 路由表：耦合較黏但多一份狀態要跟 subagent 斷線/重連同步。(b) 沿用 probe-OID：無法規模化 |
 | D4a | 接受伸手進 net-snmp 內部結構的耦合 | `netsnmp_subtree` 的 children/namelen/priority 佈局在 5.x 穩定；依賴點集中在單一函式約 15 行 | — |
 | D4b | 多 subagent 的正確性靠 **namelen 不變式**（§4.4）維持，並以 `SNMPD_CALLBACK_REGISTER_OID` 監聽器偵測違反 | 排序鍵 namelen 優先於 priority，因此 priority 無法保護 in-master：任何註冊粒度比 in-master 細的 subagent 會直接搶下 head，使 SET 與 GET 轉發雙雙失效 | (a) 靠文件約定要求 subagent 只註冊寬 root：無強制力，違反時症狀隱晦。(b) in-master 退回逐欄位註冊以確保 namelen 最長：失去機制一的全部好處（合成 index、GETNEXT 邊界又回來） |
 | D5 | framework subagent 內嵌 `libnetsnmpagent`（FRR 風格） | RFC 2741 編解碼、GETNEXT/GETBULK、table_iterator、AgentX 重連全部由 net-snmp 代勞，行為與 snmpd 端一致。並使 dlmod plugin 可幾乎原樣編入（§8.3） | (a) 純 Rust 自刻 AgentX：需重實作 GETNEXT/index 排序語意，且 dlmod 30+ 支 plugin 等於全部重寫。(b) 不做 framework subagent 只強化 dlmod：放棄 unified 目標，瓶頸只搬家 |
