@@ -31,9 +31,15 @@ for root in "${ROOTS[@]}"; do
     f="${OUT}/${root}.txt"
     echo "walking ${root} ..."
     snmpwalk -v2c -c "$COMM" -On -Cc "$HOST" "$root" > "$f" 2>&1
-    n=$(grep -c "^\." "$f" 2>/dev/null || echo 0)
-    if ! tail -1 "$f" | grep -qE "End of MIB|No more variables"; then
-        echo "  !! ${root}: ${n} OIDs, 未正常結束 —— 此次擷取無效" >&2
+    walk_rc=$?
+    n=$(grep -c "^\." "$f" 2>/dev/null)
+    if [ "$walk_rc" -ne 0 ]; then
+        echo "  !! ${root}: snmpwalk 失敗（exit ${walk_rc}）—— 此次擷取無效" >&2
+        rc=1
+    elif [ "$n" -eq 0 ]; then
+        echo "  -- ${root}: 0 OIDs（此裝置未實作此子樹）"
+    elif ! tail -1 "$f" | grep -qE "End of MIB|No more variables"; then
+        echo "  !! ${root}: ${n} OIDs，未正常結束 —— 此次擷取無效" >&2
         rc=1
     else
         echo "  ok ${root}: ${n} OIDs"
