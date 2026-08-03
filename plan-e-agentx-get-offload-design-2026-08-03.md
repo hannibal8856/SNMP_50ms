@@ -169,6 +169,77 @@ ISS 的 AgentX 路徑給出的 index 空間與 URI hook 路徑一致——
  20  1.3.6.1.2.1.4.24.7 / 4.35.1 / 4.28.1
 ```
 
+### 2.6 溢出 OID 的分類結果（483 筆全部歸類）
+
+判定依據：以 `snmp_moxa_mib/standard/*.mib` 解出各標準 MIB 的 root
+（`BRIDGE-MIB ::= { mib-2 17 }`、`P-BRIDGE-MIB ::= { dot1dBridge 6 }`、
+`Q-BRIDGE-MIB ::= { dot1dBridge 7 }`、`IF-MIB ::= { mib-2 31 }`、
+`EtherLike-MIB ::= { mib-2 35 }`(dot3 在 `mib-2 10.7`)、`OSPF-MIB ::= { mib-2 14 }`、
+`RMON-MIB ::= { mib-2 16 }`、`PTPBASE-MIB ::= { mib-2 241 }`），
+再對照 `product/MDS-G4000-L3-4XGS.profile` 的 `### Standard MIBs` 清單。
+
+#### (a) 合法補回 —— 382 筆
+
+| 筆數 | arc | 所屬 MIB（profile 內） |
+|---:|---|---|
+| 240 | `1.3.6.1.2.1.17.6` | P-BRIDGE-MIB（dot1dExtBase 等） |
+| 29 | `1.3.6.1.2.1.17.7` | Q-BRIDGE-MIB |
+| 26 | `1.3.6.1.2.1.31.1.2` | IF-MIB（ifStackTable） |
+| 24 | `1.3.6.1.2.1.10.7` | EtherLike-MIB（dot3） |
+| 13 | `1.3.6.1.2.1.2.2.1.1` | IF-MIB **ifIndex**（RFC 必要物件，mainline 缺） |
+| 13 | `1.3.6.1.2.1.31.1.1.1.1` | IF-MIB **ifName**（RFC 必要物件，mainline 缺） |
+| 12 | `1.3.6.1.2.1.17.4.4` | BRIDGE-MIB（dot1dTp 4） |
+| 12 | `1.3.6.1.2.1.17.4.5` | P-BRIDGE-MIB（dot1dTp 5） |
+| 12 | `1.3.6.1.2.1.17.4.6` | P-BRIDGE-MIB（dot1dTp 6） |
+| 1 | `1.3.6.1.2.1.14.2.1` | OSPF-MIB |
+
+**這 382 筆全部屬於本型號 profile 已宣告的標準 MIB，也就是 Moxa 對外承諾要提供、
+而 mainline 未提供的物件。** Plan E 的價值因此不只是延遲，還包括 **MIB 一致性**。
+
+#### (b) 已實作但未宣告 —— 101 筆（**產品決策**，非技術缺陷）
+
+**這 101 筆全部是標準 MIB 物件，ISS 依 RFC 正確實作，只是 Moxa 未 ship 對應的
+MIB 模組、也未列入 profile。**不是私有垃圾 OID。
+
+| 筆數 | arc | 標準物件 | 所屬 MIB | Moxa 是否 ship |
+|---:|---|---|---|---|
+| 74 | `17.2.{16,17,19}` | `dot1dStpVersion`、`dot1dStpTxHoldCount`、`dot1dStpExtPortTable`（含 `dot1dStpPortProtocolMigration` / `AdminEdgePort` / `OperEdgePort`…） | **RSTP-MIB（RFC 4318）** | ✗ |
+| 13 | `4.24` | ipForward 群組 | **IP-FORWARD-MIB** | ✗ |
+| 14 | `4.{25,26,27,28,29,33,35,38}` | ipv6 / ipNetToPhysical 等 | **IP-MIB** | ✗ |
+
+ISS 端定義位置：`code/future/vlangarp/vlan/inc/stdbridb.h:31,82-86`。
+`snmp_moxa_mib/standard/` 未 ship RSTP-MIB / IP-MIB / IP-FORWARD-MIB / UDP-MIB / TCP-MIB。
+profile 走的是 IEEE 路線（`IEEE8021-SPANNING-TREE-MIB=YES`、`IEEE8021-MSTP-MIB=YES`），
+RFC 4318 的 dot1dStp 延伸是另一條未宣告的路徑。
+
+**兩個選項，須由 RD / PM 裁決，本設計不預設立場：**
+
+- **關閉**：ISS 端不註冊（優先）或 VACM exclude。現行已排除 `4.31` / `4.32`
+  （`config_moxa_snmp_control.c:875-876`），延用同一手法即可涵蓋其餘 ip arc
+- **補文件**：ship 對應 `.mib` 並加入 product profile，把既有實作正式化
+
+#### (c) Moxa 私有 arc、已實作但未宣告 —— `mxAcl` / `mxVa`
+
+與 (b) 同性質，但落在 Moxa 私有樹，見 §9.2。ISS 有完整 MIB-DB 與 Get/Set handler：
+
+| MIB | ISS 定義 | 規模 |
+|---|---|---|
+| `mxAcl`（`8691.603.4.7`） | `code/future/ISS/{bcm,xcat,xcat_v11}/inc/mxAcldb.h`，`mxAclOID = {10, mxAcl}` | 58–62 個 OID（依 MAC SDK；本產品 `BR2_MOXA_MAC_SDK="CPSS"`） |
+| `mxVa`（`8691.603.4.15`） | `code/future/va/inc/mxVadb.h:13-30`，`mxVaOID = {10, mxVa}` | 3 個物件（global enable + port table） |
+
+同樣是「關閉 or 補 `.mib` + 加入 profile」的產品決策。
+基線未涵蓋此 arc（§2.5），須先取得完整 walk 確認實際回值。
+
+#### 本分類的限制
+
+- 「在 profile 內」代表**該 MIB 模組**為本型號宣告曝露，不等於逐一物件都應曝露；
+  269 筆的 P-BRIDGE / Q-BRIDGE 大宗建議再由 RD 確認一次
+- 本分類只比對 **OID 是否出現**，**未驗證值是否正確**。值的正確性屬各 phase 的硬門檻
+- 分類基於 `1.3.6.1.2` 的 walk；該 walk 兩側都停在 `…241.1.2.9.1.6.0.0.1.12`，
+  比對對等但未必涵蓋整棵標準樹（§2.5）
+- **不可由「找不到 Moxa 側服務者」推論為洩漏**。ISS 常有完整實作，
+  缺的只是 Moxa 的 `.mib` 與 profile 宣告。初稿犯過此錯，已修正
+
 ---
 
 ## 3. 為什麼 Plan C 的機制撐不住規模
@@ -716,8 +787,8 @@ ISS 端共 **37 個** Moxa private MIB root（掃描 `code/future/**/mx*db.h` �
 | `8691.603.3.9` | mxPhr | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_PHR is not set`；`mxPhr.mib` 存在但不在本型號 profile） |
 | `8691.603.3.10` | mxSup | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_SUPERVISION is not set`；`mxSupervision.mib`（MOXA-PRP-HSR-MIB）存在但不在 profile） |
 | `8691.603.3.12` | mxMrp | **由 ISS 提供**：profile `mxMrp=YES`、`mxMrp.mib` 存在，ies-auto-mibs 無 entry、無 dlmod plugin 註冊 → 唯一提供者是 ISS 的 AgentX 註冊。**mainline 無 AgentX master，此 MIB 實際無人服務；Plan E 是它能被曝露的前提**（基線未涵蓋此 arc，待重建後確認） |
-| `8691.603.4.7` | mxAcl | **洩漏候選**：`snmp_moxa_mib` 無 ACL MIB、profile 無 mxAcl，但 `BR2_PACKAGE_PLUGIN_MOXA_ACL=y`（plugin 有裝，不做 SNMP） |
-| `8691.603.4.15` | mxVa | **洩漏候選**：僅存在於 ISS 內部（`code/future/va/inc/mxVadb.h:13`）。Moxa 側無 plugin、無 `.mib`、profile 亦無 —— ISS 單方面在 Moxa enterprise OID 下註冊了 Moxa 從未定義的節點 |
+| `8691.603.4.7` | mxAcl | **ISS 有完整實作，Moxa 未宣告**：`code/future/ISS/{bcm,xcat,xcat_v11}/inc/mxAcldb.h` 有 `mxAclOID = {10, mxAcl}` 與 58–62 個 OID（`AclConfigMacListIndex`、`AclConfigSrcMacAddr`… 各帶 Get/Set handler）。但 `snmp_moxa_mib` 無 ACL `.mib`、profile 無 mxAcl。`BR2_PACKAGE_PLUGIN_MOXA_ACL=y` 但該 plugin 不做 SNMP → 見 §2.6(c) |
+| `8691.603.4.15` | mxVa | **ISS 有完整實作，Moxa 未宣告**：`code/future/va/inc/mxVadb.h:13-30` 有 `mxVaOID = {10, mxVa}` 與 3 個物件（`VaConfigGlobalEnable`、`VaConfigPortIndex`、`VaConfigPortEnable`，帶 Get/Set handler）。Moxa 側無 `.mib`、profile 亦無 → 見 §2.6(c) |
 
 判定依據（三個來源交叉）：
 
@@ -831,10 +902,13 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 >
 > - **(a) 合法補回** —— 在 `snmp_moxa_mib/product/<型號>.profile` 內，或屬 RFC 規定的
 >   必要物件（如 `ifIndex`、`ifName`）→ **保留**，並更新對照基線
-> - **(b) 洩漏** —— 不在 profile、Moxa 未定義（如 `mxAcl` / `mxVa`）→ **關閉**
->   （ISS 端不註冊優先，VACM exclude 為備案）
+> - **(b) 已實作但未宣告** —— ISS 依 RFC 或依 Moxa 私有 arc 正確實作，
+>   但 Moxa 未 ship 對應 `.mib`、未列入 profile（如 RSTP-MIB 的 dot1dStp 延伸、
+>   IP-MIB、`mxAcl`、`mxVa`）→ **產品決策**：關閉，或補 `.mib` 並加入 profile
 >
 > 分類結果須逐筆記錄，未分類的溢出視同未通過。
+> **(b) 類的處置屬 RD / PM 職權，不是實作者可自行決定的技術細節。**
+> 483 筆的完整分類見 §2.6。
 
 任一 phase 硬門檻不過即 rollback，不往下走。
 
@@ -898,7 +972,8 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | 483 筆溢出的關閉方式 | ISS 端不註冊（優先）vs VACM exclude（備案），逐段評估 |
 | `mxArpdb` 的 `URI_FIXED_VALUE` | `ies_auto_mibs_setup_net_mxArpdb.c` 對 `iss_build==1` 的 entry 設了 `URI_FIXED_VALUE`，但該旗標只在 `entry_handle_generate_uri_value_file()`（framework path，`:2425`）被檢查，ISS path 不看。疑似 dead code 或路由不符預期，Phase 5 遷移該組前須確認 |
 | `mxMrp` 的服務者（§9.2） | profile 為 `mxMrp=YES`、`mxMrp.mib` 存在，但找不到註冊 `8691.603.3.12` 的程式。須確認是 ISS 直接提供、尚未實作、或由他處承載。基線未涵蓋此 arc，無法從 walk 判定 |
-| `mxAcl` / `mxVa` 洩漏（§9.2） | ISS 有 AgentX 註冊，Moxa 側無 `.mib`、profile 亦無。基線未涵蓋此 arc，須先取得完整 walk 確認是否真的回值；確認為洩漏則於 Phase 8 以 ISS 端不註冊或 VACM exclude 關閉 |
+| **101 筆「已實作但未宣告」的處置**（§2.6(b)） | RSTP-MIB 的 `dot1dStp` 延伸 74 筆、IP-FORWARD-MIB 13 筆、IP-MIB 14 筆。ISS 依 RFC 實作正確，Moxa 未 ship 該 MIB 模組。**須 RD / PM 決定**：關閉，或補 `.mib` 並加入 product profile |
+| `mxAcl` / `mxVa` 的處置（§2.6(c)、§9.2） | ISS 有完整 MIB-DB 與 Get/Set handler（mxAcl 58–62 個 OID、mxVa 3 個），Moxa 未 ship `.mib`、profile 亦無。同為產品決策。基線未涵蓋此 arc，須先取得完整 walk 確認實際回值 |
 | `mxPhr` / `mxSup` 於其他型號 | 本型號未啟用故無衝突。若某型號啟用了 plugin，需確認 dlmod 與 ISS 兩邊誰服務、是否符合 §4.4 不變式 |
 | 603 walk 提早中止的原因 | mainline 停在 `8691.603.3.2.2.1.1.16.12`（mxRSTP 中途）。屬既有問題，但會阻擋基線重建，須於 Phase 0 排除 |
 | 逐型號重跑 §9.2 比對 | §9.2 的歸屬表依 MDS-G4000-L3-4XGS 組態判定。dlmod 載入清單由 `BR2_PACKAGE_PLUGIN_MOXA_*` 決定，換型號可能使某些 ISS root 失去本地覆蓋。每個出貨型號都要重跑一次比對並記錄結果 |
