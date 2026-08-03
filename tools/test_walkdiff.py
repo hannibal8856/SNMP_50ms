@@ -68,3 +68,17 @@ def test_parse_walk_joins_continuation_lines(tmp_path):
     )
     assert oids["1.3.6.1.2.1.1.2.0"] == "INTEGER: 7"
     assert complete is True
+
+
+def test_parse_walk_accepts_numeric_oid_format(tmp_path):
+    f = write(tmp_path, "w.txt", """
+        .1.3.6.1.2.1.1.1.0 = STRING: "sw"
+        .1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1
+        End of MIB
+    """)
+    oids, complete = parse_walk(f)
+    assert oids == {
+        "1.3.6.1.2.1.1.1.0": 'STRING: "sw"',
+        "1.3.6.1.2.1.2.2.1.1.1": "INTEGER: 1",
+    }
+    assert complete is True

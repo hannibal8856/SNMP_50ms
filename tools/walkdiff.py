@@ -7,7 +7,7 @@ Used as the verification loop for Plan E: every phase must show
 import re
 import sys
 
-_LINE = re.compile(r"^\s*iso([0-9.]*)\s*=\s*(.*?)\s*$")
+_LINE = re.compile(r"^\s*(?:iso([0-9.]+)|\.?(1(?:\.[0-9]+)+))\s*=\s*(.*?)\s*$")
 _TERMINATORS = ("End of MIB", "No more variables left in this MIB View")
 
 
@@ -23,8 +23,8 @@ def parse_walk(path):
                 last = line.strip()
             m = _LINE.match(line)
             if m:
-                oid = "1" + m.group(1)
-                oids[oid] = m.group(2)
+                oid = ("1" + m.group(1)) if m.group(1) else m.group(2)
+                oids[oid] = m.group(3)
                 last_oid = oid
             elif line.strip() and not any(line.startswith(t) for t in _TERMINATORS):
                 # Continuation line: append to the last OID's value
