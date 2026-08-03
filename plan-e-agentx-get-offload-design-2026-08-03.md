@@ -209,6 +209,8 @@ in-master 對每個遷移中的 MIB 改用**整段註冊**（FRR `register_mib` 
 `DEFAULT_MIB_PRIORITY = 127`（`agent_registry.h:91`）。整段註冊後兩者 OID 與 namelen 相同，
 priority 再相同就會 `MIB_DUPLICATE_REGISTRATION`，後註冊者失敗。**建議 priority = 100。**
 
+但 priority 只解決 namelen 相同的情形，**不足以保護 in-master**，見 §4.4。
+
 ### 4.3 機制二：`->children` 鏈轉發（取代 probe-OID）
 
 #### 註冊表的實際形狀
@@ -289,6 +291,57 @@ in-master 註冊範圍與 subagent root 一致，轉發回來的 OID 必在同�
 
 **驗收要求**：機制二完成時必須做 snmpwalk 與 NOS mainline 交叉比對，確認 walk 結果一致。
 
+### 4.4 多 subagent 的註冊不變式
+
+未來若有第三個 daemon 註冊為 AgentX subagent（PDF 規劃過 fiber_check / lldp / dhcp_snp），
+**priority 不是關鍵，`namelen` 才是**。排序鍵是 (`namelen` 由長到短, `priority` 由小到大)，
+`namelen` 先比，priority 只在 namelen 相同時才起作用。
+
+| 情境 | children 鏈 head | 結果 | priority 有效？ |
+|---|---|---|---|
+| 新 subagent 的 OID 範圍與 in-master **不重疊** | subagent | 該範圍 GET+SET 都歸 subagent，違反「SET 一律 in-master」 | 無關 |
+| 新 subagent 的註冊 root 與 in-master **等長** | in-master（prio 100 < 127） | 設計成立 | **有效**（唯一起作用之處） |
+| 新 subagent 註冊得**比 in-master 細**（OID 更長） | **subagent** | **in-master 被完全繞過**：SET 送到 subagent、GET 轉發不執行 | **無效** |
+
+第三種是地雷。例：in-master 註冊 `1.3.6.1.2.1.2`（namelen 7, prio 100），
+新 subagent 只註冊 `1.3.6.1.2.1.2.2.1.8`（namelen 10, prio 127）：
+
+```
+1. new subagent  namelen=10  prio=127   ← head，in-master 永遠不會被呼叫
+2. in-master     namelen=7   prio=100
+3. ISS           namelen=7   prio=127
+```
+
+把 in-master 的 priority 調到 0 也救不回來。
+
+#### 不變式（實作必須維持）
+
+> **in-master 在每一個 subagent 註冊覆蓋的 OID 範圍上，必須有 `namelen ≥` 該 subagent 的註冊。**
+
+只要這條成立，**多個 subagent 疊加本身沒有問題**。例如 ISS 註冊整個 interfaces group、
+新 daemon 只註冊 `ifOperStatus`，而 in-master 兩段都有等長註冊時：
+
+```
+1. in-master(10, 100)      ← head，SET 與轉發都正常
+2. new subagent(10, 127)   ← 轉發取到的第一個 AgentX，較細者優先，語意正確
+3. in-master(7, 100)
+4. ISS(7, 127)
+```
+
+`mox_snmp_forward_get_to_subagent()` 取 children 鏈上第一個 AgentX 節點，
+自然就是粒度最細的那個，**不需要額外判斷是哪個 subagent**。
+
+#### 偵測
+
+`SNMPD_CALLBACK_REGISTER_OID`（`agent_callbacks.h:5`）在 `agent_registry.c:1285,1322` 觸發；
+AgentX 註冊也走同一條 `netsnmp_register_mib()`（`master_admin.c:241`），因此會被攔到。
+payload `struct register_parameters`（`agent_registry.h:37-48`）帶
+`name` / `namelen` / `priority` / `session` / `reginfo` / `contextName`，足以判斷。
+
+in-master 掛一個監聽器，收到 AgentX 註冊時檢查自身是否有等長或更長的覆蓋，
+違反則記 error log（或自動補一個等長的本地註冊）。這比靠文件約定可靠，
+且新 daemon 上線時若註冊粒度不對，開機 log 就會指出來。
+
 ---
 
 ## 5. 模組邊界
@@ -296,7 +349,7 @@ in-master 註冊範圍與 subagent root 一致，轉發回來的 OID 必在同�
 | 模組 | 現在 | Plan E 之後 |
 |---|---|---|
 | `3rdparty_net_snmp/ies-auto-mibs` | OID 的 GET + SET 實作 | **SET 實作 + GET 轉發器 + OID/URI mapping 真相來源**；逐欄位註冊改整段；刪 probe 表與 `agentx_owned.list` |
-| `app_moxa_iss_10_1_0` | AgentX subagent（22 個 `RegisterMX*`） | 新增 mxLa / mxVlan / mxLldp wrapper；收斂多餘註冊 |
+| `app_moxa_iss_10_1_0` | AgentX subagent（**37 個** Moxa private MIB root，全部已 `SNMPRegisterMib`；另有標準 MIB） | 新增 mxLa / mxVlan / mxLldp wrapper；收斂多餘註冊（§9.3） |
 | `app_moxa_framework` | actix-web REST 伺服器 | **兼任 AgentX subagent** |
 | `lib_moxa_ies_auto_mibs`（新，C） | — | OID → URI mapping 唯一真相來源 |
 | `lib_moxa_rust_ies_auto_mibs`（新） | — | 上者的 Rust FFI |
@@ -533,16 +586,77 @@ ISS 內部有對應 nmh：`code/future/la/src/fslawr.c:21`
 
 **不是純改名**：`ies_auto_mibs_handle_iss_remap_table.c` 顯示 mxLa 對到
 `laConfigGroupTable` / `laStatusGroupTable` / `laConfigIfMainTable` / `laConfigPortTable`
-四張不同形狀的表，需做欄位與 index 對映 —— 與現有 22 個 wrapper 同一種工作。
+四張不同形狀的表，需做欄位與 index 對映 —— 與現有 wrapper 同一種工作。
 
-### 9.2 收斂多餘註冊
+### 9.2 ISS 註冊範圍 vs `iss_build==1` 的雙向落差
+
+ISS 端共 **37 個** Moxa private MIB root（掃描 `code/future/**/mx*db.h` 的
+`UINT4 <name>[] = {1,3,6,1,4,1,8691,…}`），全部都有 `SNMPRegisterMib` / `SNMPRegisterMibWithLock`。
+`iss_build==1` 落在 8691 私有樹的有 323 筆。兩者**不是等價集合**。
+
+#### 方向一：ies-auto-mibs 有、ISS 未覆蓋 —— 23 筆
+
+| 群組 | 筆數 | OID arc |
+|---|---|---|
+| `net_mxLadb.h` | 11 | `8691.603.1.2.1` / `.2` |
+| `net_mx_lldp.h` | 6 | `8691.603.5.1.1` |
+| `net_mx_vlan.h` | 6 | `8691.603.2.3.1` |
+
+即 §9.1 要補的三組。
+
+#### 方向二：ISS 有註冊、`iss_build==1` 不管 —— 15 個 root
+
+| ISS root | 名稱 | 實際服務者 |
+|---|---|---|
+| `8691.602.1.10` | mxEip | `plugin_moxa_eip`（dlmod） |
+| `8691.602.1.11` | mxProfinet | `plugin_moxa_profinet` |
+| `8691.602.2.3` | mxDhcpRelay | `plugin_moxa_dhcp_relay` |
+| `8691.602.3.4` | mx1588 | `plugin_moxa_ptp` |
+| `8691.603.3.8` | mxMcp | `plugin_moxa_multicoupling` |
+| `8691.603.4.10` | mxLp | `plugin_moxa_lp` |
+| `8691.603.4.12` | mxIpsg | `plugin_moxa_ipsg` |
+| `8691.603.4.13` | mxDai | `plugin_moxa_dai` |
+| `8691.603.5.8` | mxGc | `plugin_moxa_goose_check` |
+| `8691.605.4.1` | mxMR | `plugin_moxa_multicast_routing` |
+| `8691.603.3.9` | mxPhr | **掃描未找到** |
+| `8691.603.3.10` | mxSup | **掃描未找到** |
+| `8691.603.3.12` | mxMrp | **掃描未找到** |
+| `8691.603.4.7` | mxAcl | **掃描未找到** |
+| `8691.603.4.15` | mxVa | **掃描未找到** |
+
+> 掃描方法為比對 plugin `.c` 內的字面 OID 陣列；若某 plugin 以組合方式建構 OID 會被漏掉。
+> 後 5 項需人工確認（`plugin_moxa_iec62439_2` 存在但未掃到 mxMrp arc，特別值得看）。
+
+#### 兩個實質影響
+
+**(a) 前 10 項是 §4.4 不變式的現成案例，Phase 7 會改變保護方式。**
+目前 dlmod plugin 註冊 leaf 級（`OidScalar` / `OidColumn`，namelen 長），ISS 註冊 root
+（namelen 短），因此 dlmod 勝出 —— **這正是私有樹 walk diff 為 0/0 的原因**。
+Phase 7 把 dlmod 的 GET 搬進 framework subagent 後，children 鏈變成三層：
+
+```
+1. in-master（必須有等長註冊，依 §4.4）    ← head
+2. framework subagent（leaf 級，namelen 長） ← 轉發取到這個，語意正確
+3. ISS（root 級，namelen 短）
+```
+
+結果正確，但**保護機制從「dlmod 在本地」換成「namelen 排序」**。
+Phase 7 必須明確驗證這 10 個 root，不得假設。
+
+**(b) 後 5 項是潛在的 OID 洩漏。**
+ISS 有註冊、本地無人蓋。私有樹 diff = 0 表示目前不回值（ISS 那些模組在本產品可能未啟用，
+或 nmh 回 `NO_SUCH`），但這是靠 **ISS 執行期行為**而非結構保證。
+`mxPhr` 之類對應 `BR2_MOXA_PHR` 編譯旗標——換產品型號或啟用該功能，
+就可能冒出未經驗證的 Moxa private OID。列入 §12.1 待決。
+
+### 9.3 收斂多餘註冊
 
 `SnxMainRegisterMibs()`（`snxmain.c:870`）以 **MIB root 粒度**註冊，
 底下不再細分，因此帶出 §2.5 那 483 筆未實作節點。
 已排除 `enterprises.2076`；其餘需在 ISS 端不註冊（優先）或以 VACM `view all excluded` 擋掉
 （`config_moxa_snmp_control.c:859-883` 已有部分）。
 
-### 9.3 註冊粒度與 priority
+### 9.4 註冊粒度與 priority
 
 - ies-auto-mibs：現行逐欄位註冊 → 改整段
 - ISS：`SnxMainRegisterMibs()` 只註冊每棵 MIB 的 root
@@ -579,13 +693,13 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 | Phase | 內容 | go/no-go |
 |---|---|---|
 | **0** 基礎設施 | `.mk` 加 `agentx/subagent`；建 `lib_moxa_ies_auto_mibs` + Rust FFI；建 `lib_moxa_snmp_agentx` + Rust FFI | Cortex-A9 交叉編譯過；walk 差異維持現況 483/0，不得惡化 |
-| **1** 機制一 + 機制二 | ies-auto-mibs 改整段註冊（priority 100）；實作 `->children` 轉發；刪 `agentx_owned.list` 與 probe 表。**以 ifTable / ifXTable 驗證**（Plan C 的等價替換，有現成基線可比） | 硬門檻 + 延遲；walk 與 mainline 交叉比對一致 |
+| **1** 機制一 + 機制二 | ies-auto-mibs 改整段註冊（priority 100）；實作 `->children` 轉發；掛 `SNMPD_CALLBACK_REGISTER_OID` 監聽器檢查 §4.4 的 namelen 不變式；刪 `agentx_owned.list` 與 probe 表。**以 ifTable / ifXTable 驗證**（Plan C 的等價替換，有現成基線可比） | 硬門檻 + 延遲；walk 與 mainline 交叉比對一致；開機 log 無不變式違反 |
 | **2** iss1 私有 MIB 試點 | **`mxPortdb`**（17 筆，RO 9 / RW 8，OID 根 `1.3.6.1.4.1.8691.603.1.1`）。ISS 側有 `RegisterMXPORT` + `mxPortdb.h`；5 個 URI 涵蓋 1 scalar + 4 table，其中 `portConfigTable` 是 §3.3 的 24 張風險表之一 → 直接驗證機制一確實解掉合成 index 問題 | 硬門檻；`portConfigTable` 的 col-1 由 ISS 提供且值正確 |
 | **3** framework subagent 骨架 + iss0 試點 | 內嵌 libnetsnmpagent、fd 掛 tokio。試點兩組：**`mx_device_io`**（8 筆、全 RO、走 status layer、實際輪詢對象）取 benchmark 數據；**`mx_portmirror`**（18 筆、RO 2 / RW 16、含 4 個 `REPLACE_TRUTH_VALUE`）驗證 §7 語意轉換移植 | 硬門檻；SET 仍走 in-master 不變 |
 | **4** **Benchmark 決策點** | 對 Phase 2（iss1）與 Phase 3（iss0）試點做導入前 / 後延遲對比 | **全量遷移的 go/no-go**。效益不成立就停在此處重新評估 |
 | **5** 全量 `iss_build==1` | 逐 MIB 上線；含 §9.1 ISS 補 mxLa / mxVlan / mxLldp wrapper | 每組硬門檻 |
 | **6** 全量 `iss_build==0` | 移植 §7 全部語意轉換；分組上線，567 筆事件組態表放最後 | 每組硬門檻 |
-| **7** dlmod GET 遷移 | `lib_moxa_snmp_plugin` backend 抽象化；plugin 原始碼編兩次；拆 `security_tokens[]` 相依 | 硬門檻；SET 行為不變；fiber_check 延遲改善量測 |
+| **7** dlmod GET 遷移 | `lib_moxa_snmp_plugin` backend 抽象化；plugin 原始碼編兩次；拆 `security_tokens[]` 相依 | 硬門檻；SET 行為不變；fiber_check 延遲改善量測；**§9.2(a) 的 10 個 root 逐一驗證 children 鏈順序**（保護機制由「dlmod 在本地」換成 namelen 排序） |
 | **8** 收尾 | 關閉 483 筆溢出；移除 snmpEngine 4 筆；sysObjectID 收進 Path 1 | 雙向差異為零 |
 
 ### 10.3 為什麼 Phase 1-2 排在 framework 之前
@@ -606,6 +720,7 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | D3 | 逐欄位註冊改整段註冊（FRR `register_mib` 風格） | 順帶消滅 §3.3 的 24 張表合成 index 風險，以及 §4.3 的 GETNEXT 邊界風險 | 維持逐欄位並個別修 `GenerateTableIndexEntry`：治標，且 GETNEXT 風險仍在 |
 | D4 | 機制二走 `netsnmp_subtree` 的 `->children` 鏈 | probe-OID 依賴「同區內存在 ISS 獨佔 RO instance」，是每張表的偶然性質，無法通用化。children 走訪是 net-snmp 自己的慣用法（`agent_registry.c:1705`） | (a) 自建 `SNMPD_CALLBACK_REGISTER_OID` 路由表：耦合較黏但多一份狀態要跟 subagent 斷線/重連同步。(b) 沿用 probe-OID：無法規模化 |
 | D4a | 接受伸手進 net-snmp 內部結構的耦合 | `netsnmp_subtree` 的 children/namelen/priority 佈局在 5.x 穩定；依賴點集中在單一函式約 15 行 | — |
+| D4b | 多 subagent 的正確性靠 **namelen 不變式**（§4.4）維持，並以 `SNMPD_CALLBACK_REGISTER_OID` 監聽器偵測違反 | 排序鍵 namelen 優先於 priority，因此 priority 無法保護 in-master：任何註冊粒度比 in-master 細的 subagent 會直接搶下 head，使 SET 與 GET 轉發雙雙失效 | (a) 靠文件約定要求 subagent 只註冊寬 root：無強制力，違反時症狀隱晦。(b) in-master 退回逐欄位註冊以確保 namelen 最長：失去機制一的全部好處（合成 index、GETNEXT 邊界又回來） |
 | D5 | framework subagent 內嵌 `libnetsnmpagent`（FRR 風格） | RFC 2741 編解碼、GETNEXT/GETBULK、table_iterator、AgentX 重連全部由 net-snmp 代勞，行為與 snmpd 端一致。並使 dlmod plugin 可幾乎原樣編入（§8.3） | (a) 純 Rust 自刻 AgentX：需重實作 GETNEXT/index 排序語意，且 dlmod 30+ 支 plugin 等於全部重寫。(b) 不做 framework subagent 只強化 dlmod：放棄 unified 目標，瓶頸只搬家 |
 | D6 | 新增 `lib_moxa_snmp_agentx`（C）+ `lib_moxa_rust_snmp_agentx`（Rust）兩層 | 主要是**封裝邊界**：`libnetsnmpmibs` 內含 ies-auto-mibs，直接連 `--agent-libs` 會把它拖進 framework。次要是把 net-snmp 的 union / 巨集收斂成純量 API 再 FFI | 直接在 framework 用 bindgen 對 `libnetsnmpagent`：會連帶拖入 `libnetsnmpmibs`，且 bindgen 產出脆弱 |
 | D7 | GET 路徑不持有任何 token；SET 路徑 token 機制完全不動 | AgentX PDU 不帶 `securityName`，subagent 在協定上拿不到身分。master 已完成 USM + VACM。身分複雜度全部關在未改動的 SET 路徑 | (a) 固定內部服務身分 token（role admin）：GET 不需要，多餘權限。(b) 沿用 `security_token`：同上，且無意義 |
@@ -628,6 +743,7 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | framework subagent 的批次取值 | value-file 的「一次取整張表」語意是否需要在 in-process 重現。取決於 config/status layer 單次查詢成本 |
 | 483 筆溢出的關閉方式 | ISS 端不註冊（優先）vs VACM exclude（備案），逐段評估 |
 | `mxArpdb` 的 `URI_FIXED_VALUE` | `ies_auto_mibs_setup_net_mxArpdb.c` 對 `iss_build==1` 的 entry 設了 `URI_FIXED_VALUE`，但該旗標只在 `entry_handle_generate_uri_value_file()`（framework path，`:2425`）被檢查，ISS path 不看。疑似 dead code 或路由不符預期，Phase 5 遷移該組前須確認 |
+| 5 個無主 ISS root（§9.2） | `mxPhr` / `mxSup` / `mxMrp` / `mxAcl` / `mxVa`：ISS 有 AgentX 註冊、本地無人覆蓋。須人工確認 (1) 是否真的無人服務（掃描只看字面 OID 陣列），(2) 在本產品組態下 ISS 是否確實不回值，(3) 換型號 / 開啟對應 `BR2_MOXA_*` 旗標後的行為。若確認為洩漏，於 Phase 8 以 ISS 端不註冊或 VACM exclude 關閉 |
 
 ### 12.2 Future Works
 
