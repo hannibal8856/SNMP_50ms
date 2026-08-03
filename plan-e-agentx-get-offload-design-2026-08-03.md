@@ -139,7 +139,24 @@ Path 2/3 都不直接回值，而是先把資料寫成 tmpfs 上的**純文字�
 >
 > **Phase 0 的第一件事必須是修掉 (a) 並重建完整基線**，見 §10.1.1。
 
-多出的 483 筆全在標準 MIB，是 ISS 註冊整棵 root 帶出的未實作節點：
+多出的 483 筆全在標準 MIB。**這些不全是洩漏——至少 26 筆是補回 mainline 缺失的必要物件**：
+
+| | mainline | Plan C |
+|---|---|---|
+| `1.3.6.1.2.1.2.2.1.1`（**ifIndex**） | **零筆** | `[1..12, 130]` |
+| `1.3.6.1.2.1.31.1.1.1.1`（**ifName**） | **零筆** | `[1..12, 130]` |
+
+`ifIndex` / `ifName` 是 IF-MIB 的必要物件，**mainline 完全沒有曝露**。
+推測原因是 `MAKEUP_INDEX_FOR_ISS`（旗標註解：「iss won't generate table index for mib_db,
+so we have to makeup index for it」）對 ifTable 未生效。Plan C 把 col 1 交給 ISS 後即正常。
+
+**同時證明 port index remapper 沒有被繞過**：ifTable 的 col 2–22 與 ifXTable 的 col 2–19，
+mainline 與 Plan C 的 index 集合**逐欄完全相同**（含 `130` 這個非連續值）。
+ISS 的 AgentX 路徑給出的 index 空間與 URI hook 路徑一致——
+`remapper_util_check_data_port()` 的過濾/重編號未造成分歧。
+（此結論只由 ifTable/ifXTable 實證，不可外推到其他群組，見 §9.1。）
+
+其餘溢出多為 ISS 註冊整棵 root 帶出的節點：
 
 ```
 240  1.3.6.1.2.1.17.6.1     pBridge
@@ -622,9 +639,49 @@ ISS 內部有對應 nmh：`code/future/la/src/fslawr.c:21`
 把 `nmhGetMabConfig*` 包成 Moxa OID 的 MIB entry），新增 `mxLa` / `mxVlan` / `mxLldp`
 三組 wrapper 掛在 Moxa arc。
 
-**不是純改名**：`ies_auto_mibs_handle_iss_remap_table.c` 顯示 mxLa 對到
-`laConfigGroupTable` / `laStatusGroupTable` / `laConfigIfMainTable` / `laConfigPortTable`
-四張不同形狀的表，需做欄位與 index 對映 —— 與現有 wrapper 同一種工作。
+**兩套 OID 的對應關係**（以 `mxLa` 的 `ifMainType` 為例）：
+
+| 端 | OID | 意義 |
+|---|---|---|
+| snmpd / `net_mxLadb.h` | `1.3.6.1.4.1.8691.603.1.2.1.1.1.2` | Moxa 對外 OID |
+| ISS / `fscfadb.h:38` | `1.3.6.1.4.1.2076.27.1.4.1.2` | Future Software 內部 OID |
+
+```c
+/* code/future/cfa2/inc/fscfadb.h:38,203 */
+UINT4 IfMainType [ ] = {1,3,6,1,4,1,2076,27,1,4,1,2};
+{{12,IfMainType}, GetNextIndexIfMainTable, IfMainTypeGet, IfMainTypeSet, IfMainTypeTest,
+ IfMainTableDep, SNMP_DATA_TYPE_INTEGER, SNMP_READWRITE, IfMainTableINDEX, 1, 0, 0, NULL},
+```
+
+目前外部 GET 的完整路徑：
+
+```
+GET 8691.603.1.2.1.1.1.2.<idx>
+  → ies-auto-mibs entry：uri = "fscfadb/ifMainTable/", uri_index = "ifMainType"
+  → ISS URI thread 依 URI 查表
+  → 得到 ISS OID 2076.27.1.4.1.2 + index
+  → IfMainTypeGet → nmhGetIfMainType
+```
+
+**所以 ISS 內的 GET handler 本來就是 `IfMainTypeGet` / `nmhGetIfMainType`；
+缺的只是一筆掛在 Moxa arc 底下、指向同一組 function pointer 的 MIB-DB 列。**
+工作是新增 `{{n, MxLaIfMainType}, GetNextIndexIfMainTable, IfMainTypeGet, IfMainTypeSet, …}`
+——OID 陣列換掉、function pointer 原樣沿用，與 `mxMabwr.c` 同一種形狀。
+
+**需逐組驗證的一點：port index 空間。**
+URI hook 路徑上有 `remapper_handle_table_{read,update}_for_port_index_table`
+（`iss_snmp_uri_remap_fscfadb.c`、`iss_snmp_uri_remap_fsladb.c`），
+底層 `remapper_util_check_data_port()`（`iss_snmp_uri_remap.c:376`）會依
+`gMaxPortInSystem` / `gMaxPortInPlatform` 做**過濾**（`OID_PORT_FILTER`）與
+**重編號**（`OID_PORT_UPDATE`），且分 `INCLUDE_MOXA_L3` 條件編譯。
+直接註冊 Moxa arc 會走 ISS 的 SNMP 側 index，繞過這層。
+
+實測顯示 ifTable / ifXTable **沒有分歧**（§2.5：col 2 之後逐欄 index 集合相同，
+含 `130`），代表 ISS 的 SNMP 側 index 與 remap 後的結果一致。
+但**這只由 ifTable 一例證實，mxLa 對到的是 `laConfigGroupTable` /
+`laStatusGroupTable` / `laConfigIfMainTable` / `laConfigPortTable` 四張不同形狀的表**
+（見 `ies_auto_mibs_handle_iss_remap_table.c`），必須逐張以 walk 比對 index 集合，
+不可外推。
 
 ### 9.2 ISS 註冊範圍 vs `iss_build==1` 的雙向落差
 
@@ -764,7 +821,20 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 |---|---|---|
 | **無回歸（硬門檻）** | `mainline − planE = ∅`，且共同 OID 的型別與值逐筆相同 | **每一個 phase** |
 | **延遲** | 該 phase 涵蓋的熱路徑 OID，GET p100 < 50 ms | 每一個 phase |
-| **無溢出（收尾門檻）** | `planE − mainline = ∅`（目前欠 483 筆） | 最終 phase |
+| **溢出已分類（收尾門檻）** | `planE − mainline` 的每一筆都已判定為「合法補回」或「洩漏」，且洩漏已關閉 | 最終 phase |
+
+> **溢出門檻不是「歸零」。** 初稿寫成 `planE − mainline = ∅` 是錯的：
+> 那 483 筆中至少 26 筆是補回 mainline 缺失的 `ifIndex` / `ifName`（§2.5），
+> 照「歸零」執行會把 IF-MIB 的必要物件再弄壞一次。
+>
+> 正確做法是逐筆分類：
+>
+> - **(a) 合法補回** —— 在 `snmp_moxa_mib/product/<型號>.profile` 內，或屬 RFC 規定的
+>   必要物件（如 `ifIndex`、`ifName`）→ **保留**，並更新對照基線
+> - **(b) 洩漏** —— 不在 profile、Moxa 未定義（如 `mxAcl` / `mxVa`）→ **關閉**
+>   （ISS 端不註冊優先，VACM exclude 為備案）
+>
+> 分類結果須逐筆記錄，未分類的溢出視同未通過。
 
 任一 phase 硬門檻不過即 rollback，不往下走。
 
@@ -847,6 +917,9 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 - VRRPv2（`.68`）/ VRRPv3（`.207`）回 `badValue` 導致 snmpwalk 中斷，
   目前以 VACM exclude 迴避（`config_moxa_snmp_control.c:882-883`）
 - `snmpEngineTime` 回傳 0（由 D12 一併解決）
+- **mainline 的 `ifTable` 缺 `ifIndex`、`ifXTable` 缺 `ifName`**（IF-MIB 必要物件）。
+  推測為 `MAKEUP_INDEX_FOR_ISS` 對 ifTable 未生效。**Plan C 已順帶修好**（§2.5），
+  Plan E 沿用同一機制，故不需額外處理——但驗收時不可把它當成「溢出」而關掉
 - **`8691.602` → `8691.603` 交界回 endOfMibView**：從 `1.3.6.1.4` 或 `.1` 起跑的
   全樹 snmpwalk 在 `8691.602.5.1.1.8.0` 之後即宣告 `End of MIB`，
   導致整個 `8691.603.*`（ISS 供應的 Moxa 私有 MIB，本型號 profile 中有數十個
