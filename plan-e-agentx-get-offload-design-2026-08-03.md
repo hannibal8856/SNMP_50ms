@@ -110,24 +110,34 @@ Path 2/3 都不直接回值，而是先把資料寫成 tmpfs 上的**純文字�
 | `1.3.6.1.2`（標準 MIB） | 1736 | 2219 | 483 | **0** |
 | `1.3.6.1.4`（Moxa 私有，見下方涵蓋範圍警告） | 749 | 749 | 0 | **0** |
 
-> **⚠ 既有基線的涵蓋範圍遠小於檔名所示，這是驗證資料的重大缺口。**
+> **⚠ 既有基線的涵蓋範圍遠小於檔名所示，且揭露一個 mainline 既有缺陷。**
 >
-> - `snmpwalk-*-1.3.6.1.4.txt`（mainline 與 Plan C 兩份）實際只走到 `8691.602.5`，
->   內容是 `8691.602.*`（527+50+43+13+2）、`8691.600.2`（5）、`2021.13.14`（109）。
->   **從未進入 `8691.603.*`。**
-> - 唯一涵蓋 603 的檔（`snmpwalk-NOS7-…-1.3.6.1.4.1.8691.603.txt`，**只有 mainline 有**）
->   最後一筆是 `8691.603.3.2.2.1.1.16.12`，**停在 mxRSTP 中途**；
->   只涵蓋 `603.1.1`(148)、`603.1.2`(49)、`603.2.3`(25)、`603.2.9`(324)、`603.3.2`(256)。
-> - 因此 `603.3.5` 之後（mxTc / mxDual / mxMcp / mxPhr / mxSup / mxMrp / mxAcl /
->   mxLp / mxVa / mxLldp / mxPsms / mxPssp / mxMab …）**從未被比對過**，
->   而 Plan C 側連 603 的 walk 檔都沒有。
+> 兩類 walk 檔的中止性質不同，必須分開看：
 >
-> 上表「私有樹 0/0」只成立於 `8691.602.*`（dlmod 地盤）。
+> | 檔案 | 最後一行 | 意義 |
+> |---|---|---|
+> | `snmpwalk-*-1.3.6.1.4.txt`（mainline 與 Plan C 皆同） | `End of MIB` | **agent 主動回 endOfMibView** |
+> | `snmpwalk-*-…8691.603.txt`（mainline 與 plan-D 皆同） | 資料行，無 `End of MIB` | 人為中斷，測試範圍問題 |
+>
+> **(a) `1.3.6.1.4` walk 是 agent 說沒了，不是沒測。**
+> 它在 `8691.602.5.1.1.8.0` 之後回報 endOfMibView，內容僅
+> `8691.602.*`（527+50+43+13+2）、`8691.600.2`（5）、`2021.13.14`（109）。
+> 但**同一次量測**（同 timestamp `2026_0713_1621`、同一台機器）另跑的 603 walk
+> 證明 `8691.603.*` 有 802 個 OID 存在。
+>
+> → **GETNEXT 在 602/603 交界回了 endOfMibView。從 `1.3.6.1.4` 或 `.1` 起跑的完整 walk
+> 永遠到不了 `8691.603.*`，NMS 全樹輪詢會漏掉所有 ISS 提供的 Moxa 私有 MIB。**
+> mainline 與 Plan C 行為一致，屬**既有缺陷**，非 Plan C/D 造成。見 §12.3。
+>
+> **(b) 603 walk 是人為中斷。** 兩份都停在 `8691.603.3.2.2.1.1.16.12`（mxRSTP 中途），
+> 只涵蓋 `603.1.1`(148)、`603.1.2`(49)、`603.2.3`(25)、`603.2.9`(324)、`603.3.2`(256)。
+> `603.3.5` 之後（mxTc / mxDual / mxMcp / mxPhr / mxSup / mxMrp / mxAcl / mxLp /
+> mxVa / mxLldp / mxPsms / mxPssp / mxMab …）**從未被比對過**；Plan C 側連 603 檔都沒有。
+>
+> 因此上表「私有樹 0/0」只成立於 `8691.602.*`（dlmod 地盤）。
 > **`8691.603.*`（ISS / ies-auto-mibs 地盤，Plan E 的主戰場）尚無有效基線。**
-> 兩份 603 walk 都提早中止，中止原因本身也是待查項（PDF 記載 VRRPv2/v3 會使 walk 中斷，
-> 但此處停在 mxRSTP，可能是另一個問題）。
 >
-> **Phase 0 的第一件事必須是重建完整基線**，見 §10.1。
+> **Phase 0 的第一件事必須是修掉 (a) 並重建完整基線**，見 §10.1.1。
 
 多出的 483 筆全在標準 MIB，是 ISS 註冊整棵 root 帶出的未實作節點：
 
@@ -647,8 +657,8 @@ ISS 端共 **37 個** Moxa private MIB root（掃描 `code/future/**/mx*db.h` �
 | `8691.603.5.8` | mxGc | `plugin_moxa_goose_check` |
 | `8691.605.4.1` | mxMR | `plugin_moxa_multicast_routing` |
 | `8691.603.3.9` | mxPhr | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_PHR is not set`；`mxPhr.mib` 存在但不在本型號 profile） |
-| `8691.603.3.10` | mxSup | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_SUPERVISION is not set`；`mxSupervision.mib` 存在但不在 profile） |
-| `8691.603.3.12` | mxMrp | **待查**：profile 為 `mxMrp=YES`、`mxMrp.mib` 存在，但 `plugin_moxa_iec62439_2/snmp` 只有兩個 `.c`，註冊 `1.0.62439.1.1`（IEC 標準）與 `8691.603.4.10.2`（mxLp arc），**未見 mxMrp 註冊者** |
+| `8691.603.3.10` | mxSup | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_SUPERVISION is not set`；`mxSupervision.mib`（MOXA-PRP-HSR-MIB）存在但不在 profile） |
+| `8691.603.3.12` | mxMrp | **由 ISS 提供**：profile `mxMrp=YES`、`mxMrp.mib` 存在，ies-auto-mibs 無 entry、無 dlmod plugin 註冊 → 唯一提供者是 ISS 的 AgentX 註冊。**mainline 無 AgentX master，此 MIB 實際無人服務；Plan E 是它能被曝露的前提**（基線未涵蓋此 arc，待重建後確認） |
 | `8691.603.4.7` | mxAcl | **洩漏候選**：`snmp_moxa_mib` 無 ACL MIB、profile 無 mxAcl，但 `BR2_PACKAGE_PLUGIN_MOXA_ACL=y`（plugin 有裝，不做 SNMP） |
 | `8691.603.4.15` | mxVa | **洩漏候選**：僅存在於 ISS 內部（`code/future/va/inc/mxVadb.h:13`）。Moxa 側無 plugin、無 `.mib`、profile 亦無 —— ISS 單方面在 Moxa enterprise OID 下註冊了 Moxa 從未定義的節點 |
 
@@ -657,6 +667,17 @@ ISS 端共 **37 個** Moxa private MIB root（掃描 `code/future/**/mx*db.h` �
 1. **`snmp_moxa_mib/product/<型號>.profile`** —— 官方「本型號應曝露哪些 MIB」清單，權威來源
 2. **`snmp_moxa_mib/private/*.mib`** —— Moxa 是否對外定義過此 MIB
 3. **`buildroot/.config` 的 `BR2_PACKAGE_PLUGIN_MOXA_*`** —— 本型號是否安裝該 plugin
+
+MIB 定義與 ISS OID 的對照（`mxSwitching.mib:46`：`layer2Redundancy ::= { switching 3 }`，
+`switching = 8691.603`，故 `layer2Redundancy = 8691.603.3`）：
+
+| `.mib` | 定義 | 解析後 OID | ISS 端 header | 相符 |
+|---|---|---|---|---|
+| `mxMrp.mib:33` | `::= { layer2Redundancy 12 }` | `8691.603.3.12` | `mxMrpdb.h` | ✓ |
+| `mxPhr.mib:33` | `::= { layer2Redundancy 9 }` | `8691.603.3.9` | `mxPhrdb.h` | ✓ |
+| `mxSupervision.mib:32` | `::= { layer2Redundancy 10 }` | `8691.603.3.10` | `mxSupdb.h` | ✓ |
+
+三者的 Moxa MIB 定義與 ISS 註冊 OID 完全吻合，證明它們是正規的 Moxa 私有 MIB、由 ISS 供應。
 
 > **不可用「`dl/` 底下有無該目錄」判定 plugin 是否存在**：`dl/` 只含本組態實際 fetch 的套件，
 > 目錄不存在只代表未啟用。這是本文件初稿的判定錯誤，已修正。
@@ -727,8 +748,10 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 §2.5 的警告指出既有基線並未涵蓋 `8691.603.*`，且兩份 603 walk 都提早中止。
 在任何 phase 開始前必須先處理：
 
-1. **查明 walk 中止原因**。mainline 的 603 walk 停在 `8691.603.3.2.2.1.1.16.12`（mxRSTP 中途）。
-   先確認是 timeout、`badValue`、或 agent 端錯誤，修掉或以 VACM 迴避後才能取得完整基線。
+1. **修掉 602/603 交界的 endOfMibView**（§2.5(a)、§12.3）。這是 mainline 既有缺陷：
+   從 `1.3.6.1.4` 起跑的 walk 在 `8691.602.5.1.1.8.0` 之後就宣告結束，
+   使 `8691.603.*` 完全無法透過全樹 walk 取得。**不修就取不到有效基線，也無法定義驗收。**
+   （603 walk 檔的中止是人為停止，非缺陷，重測即可。）
 2. **重取完整基線**，mainline 與 Plan E build 各一份，至少涵蓋
    `1.3.6.1.2`、`1.3.6.1.4.1.8691.602`、`1.3.6.1.4.1.8691.603`、`1.3.6.1.4.1.8691.605`、
    `1.0.8802`、`1.3.111`、`1.2.840`。
@@ -824,3 +847,9 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 - VRRPv2（`.68`）/ VRRPv3（`.207`）回 `badValue` 導致 snmpwalk 中斷，
   目前以 VACM exclude 迴避（`config_moxa_snmp_control.c:882-883`）
 - `snmpEngineTime` 回傳 0（由 D12 一併解決）
+- **`8691.602` → `8691.603` 交界回 endOfMibView**：從 `1.3.6.1.4` 或 `.1` 起跑的
+  全樹 snmpwalk 在 `8691.602.5.1.1.8.0` 之後即宣告 `End of MIB`，
+  導致整個 `8691.603.*`（ISS 供應的 Moxa 私有 MIB，本型號 profile 中有數十個
+  `=YES` 項目）**無法經由正常 walk 取得**；必須以 `8691.603` 為根另跑才看得到。
+  mainline 與 Plan C 行為一致，為既有缺陷。
+  影響超出 Plan E 範圍（NMS 全樹輪詢會漏資料），但**阻擋基線建立，故列為 Phase 0 前置**
