@@ -649,7 +649,7 @@ ISS GET path 一次都沒引用。
 | `ies_uri_handle_client` | **保留不動**。19+ 個使用者（`app_moxa_iss_config_loader`、`lib_moxa_rust_iss`、多支 plugin 的 `framework/src/command.rs`、python command script…），大多與 SNMP 無關 |
 | value-file 快取 | **退出 GET 主線**。桶 A / 桶 B 的 GET 都走 AgentX |
 | in-master fallback | **原樣保留**。subagent 斷線時的降級路徑 |
-| framework subagent 內部 | **不重建這套檔案機制**。批次取值（一次拿整張表）是否需要，待 config/status layer 查詢成本量測後決定 |
+| framework subagent 內部 | **不重建這套檔案機制，且絕不使用 `ies_uri_handle_client`**（D15）。subagent 直接 in-process 呼叫 config/status layer 並回二進位 varbind；批次取值不重現。若日後量測顯示 layer 查詢成本過高需要快取，載體也不得是檔案 |
 
 ---
 
@@ -814,7 +814,7 @@ ISS 端共 **37 個** Moxa private MIB root（掃描 `code/future/**/mx*db.h` �
 | `8691.605.4.1` | mxMR | `plugin_moxa_multicast_routing` |
 | `8691.603.3.9` | mxPhr | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_PHR is not set`；`mxPhr.mib` 存在但不在本型號 profile） |
 | `8691.603.3.10` | mxSup | **本型號未啟用**（`# BR2_PACKAGE_PLUGIN_MOXA_SUPERVISION is not set`；`mxSupervision.mib`（MOXA-PRP-HSR-MIB）存在但不在 profile） |
-| `8691.603.3.12` | mxMrp | **由 ISS 提供**：profile `mxMrp=YES`、`mxMrp.mib` 存在，ies-auto-mibs 無 entry、無 dlmod plugin 註冊 → 唯一提供者是 ISS 的 AgentX 註冊。**mainline 無 AgentX master，此 MIB 實際無人服務；Plan E 是它能被曝露的前提**（基線未涵蓋此 arc，待重建後確認） |
+| `8691.603.3.12` | mxMrp | **由 ISS 提供，已確認**：`code/future/iec62439_2/inc/mxMrpdb.h:14-15,108` 定義 `mxMrpOID` 與 `tMibData mxMrpEntry = { 28, mxMrpMibEntry }`（28 個物件），`mxMrpwr.c:31` 的 `RegisterMXMRP()` 由 `iec62439_2main.c:85` 呼叫。profile `mxMrp=YES`、`BR2_PACKAGE_PLUGIN_MOXA_IEC62439_2=y`。**注意 Moxa 側的 `plugin_moxa_iec62439_2` 服務的是 IEC 標準 MIB `1.0.62439.1.1` 與 mxLp status，兩者是不同東西** |
 | `8691.603.4.7` | mxAcl | **ISS 有完整實作，Moxa 未宣告**：`code/future/ISS/{bcm,xcat,xcat_v11}/inc/mxAcldb.h` 有 `mxAclOID = {10, mxAcl}` 與 58–62 個 OID（`AclConfigMacListIndex`、`AclConfigSrcMacAddr`… 各帶 Get/Set handler）。但 `snmp_moxa_mib` 無 ACL `.mib`、profile 無 mxAcl。`BR2_PACKAGE_PLUGIN_MOXA_ACL=y` 但該 plugin 不做 SNMP → 見 §2.6(c) |
 | `8691.603.4.15` | mxVa | **ISS 有完整實作，Moxa 未宣告**：`code/future/va/inc/mxVadb.h:13-30` 有 `mxVaOID = {10, mxVa}` 與 3 個物件（`VaConfigGlobalEnable`、`VaConfigPortIndex`、`VaConfigPortEnable`，帶 Get/Set handler）。Moxa 側無 `.mib`、profile 亦無 → 見 §2.6(c) |
 
@@ -904,10 +904,12 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 §2.5 的警告指出既有基線並未涵蓋 `8691.603.*`，且兩份 603 walk 都提早中止。
 在任何 phase 開始前必須先處理：
 
-1. **修掉 602/603 交界的 endOfMibView**（§2.5(a)、§12.3）。這是 mainline 既有缺陷：
-   從 `1.3.6.1.4` 起跑的 walk 在 `8691.602.5.1.1.8.0` 之後就宣告結束，
-   使 `8691.603.*` 完全無法透過全樹 walk 取得。**不修就取不到有效基線，也無法定義驗收。**
-   （603 walk 檔的中止是人為停止，非缺陷，重測即可。）
+1. **改以分段 scoped walk 取得基線，不修 mainline 的 endOfMibView 缺陷**（D16）。
+   從 `1.3.6.1.4` 起跑的 walk 在 `8691.602.5.1.1.8.0` 之後即宣告結束（§2.5(a)、§12.3），
+   但**以各子樹 root 分別 walk 即可完整取得**——既有的
+   `snmpwalk-NOS7-…-1.3.6.1.4.1.8691.603.txt` 就是這樣拿到 802 筆的。
+   該缺陷屬 mainline 既有問題，修它不在 Plan E 範圍。
+   （603 walk 檔停在 mxRSTP 是人為中斷，非缺陷，重測即可。）
 2. **重取完整基線**，mainline 與 Plan E build 各一份，至少涵蓋
    `1.3.6.1.2`、`1.3.6.1.4.1.8691.602`、`1.3.6.1.4.1.8691.603`、`1.3.6.1.4.1.8691.605`、
    `1.0.8802`、`1.3.111`、`1.2.840`。
@@ -950,7 +952,7 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 
 | Phase | 內容 | go/no-go |
 |---|---|---|
-| **0** 基礎設施 | **先做 §10.1.1 重建基線**（查明 walk 中止原因、取完整 mainline/Plan E 基線）；`.mk` 加 `agentx/subagent`；建 `lib_moxa_ies_auto_mibs` + Rust FFI；建 `lib_moxa_snmp_agentx` + Rust FFI | 完整基線取得且 walk 未提早中止；Cortex-A9 交叉編譯過；差異不得較基線惡化 |
+| **0** 基礎設施 | **先做 §10.1.1 重建基線**（分段 scoped walk 取完整 mainline/Plan E 基線，不修 mainline 缺陷）；`.mk` 加 `agentx/subagent`；建 `lib_moxa_ies_auto_mibs` + Rust FFI；建 `lib_moxa_snmp_agentx` + Rust FFI | 各子樹基線取得且無人為中斷；Cortex-A9 交叉編譯過；差異不得較基線惡化 |
 | **1** 機制一 + 機制二 | ies-auto-mibs 改整段註冊（priority 100）；實作 `->children` 轉發；掛 `SNMPD_CALLBACK_REGISTER_OID` 監聽器檢查 §4.4 的 namelen 不變式；刪 `agentx_owned.list` 與 probe 表。**以 ifTable / ifXTable 驗證**（Plan C 的等價替換，有現成基線可比） | 硬門檻 + 延遲；walk 與 mainline 交叉比對一致；開機 log 無不變式違反 |
 | **2** iss1 私有 MIB 試點 | **`mxPortdb`**（17 筆，RO 9 / RW 8，OID 根 `1.3.6.1.4.1.8691.603.1.1`）。ISS 側有 `RegisterMXPORT` + `mxPortdb.h`；5 個 URI 涵蓋 1 scalar + 4 table，其中 `portConfigTable` 是 §3.3 的 24 張風險表之一 → 直接驗證機制一確實解掉合成 index 問題 | 硬門檻；`portConfigTable` 的 col-1 由 ISS 提供且值正確 |
 | **3** framework subagent 骨架 + iss0 試點 | 內嵌 libnetsnmpagent、fd 掛 tokio。試點兩組：**`mx_device_io`**（8 筆、全 RO、走 status layer、實際輪詢對象）取 benchmark 數據；**`mx_portmirror`**（18 筆、RO 2 / RW 16、含 4 個 `REPLACE_TRUTH_VALUE`）驗證 §7 語意轉換移植 | 硬門檻；SET 仍走 in-master 不變 |
@@ -1002,6 +1004,8 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | D12 | §1.2、§4.1 |
 | D13 | §1.3 |
 | D14 | §10.2 |
+| D15 | §7.2 |
+| D16 | §10.1.1、§12.3 |
 
 | # | 決策 | 理由 | 被否決的方案與原因 |
 |---|---|---|---|
@@ -1021,24 +1025,31 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 | D12 | `snmpEngine`（`1.3.6.1.6.3.10.2.1.{1,2,3,4}`）4 筆移除 | 與 net-snmp 原生 `snmpv3/snmpEngine.c` 重疊（`default_modules.h:6` 對 mini-agent 也生效）。實機驗證 `snmpEngineTime = 0` 為錯值，佐證正繞道 framework REST | 收進 Path 1：仍是重複實作 |
 | D13 | 本階段僅驗證 Cortex-A9，CN9130 不納入 | 避免節外生枝；目前實作以 Cortex-A9 為主 | — |
 | D14 | Phase 排序為「試點 → benchmark 決策點 → 全量」 | 效益未經量測前不做全量遷移 | 逐步推進：全量成本在效益未驗證前就已投入 |
+| D15 | framework subagent **不重現 value-file 的批次取值**；且 **絕不使用 `ies_uri_handle_client`** | subagent 直接 in-process 呼叫 config/status layer 回二進位 varbind，批次檔案語意失去存在理由。`ies_uri_handle_client` 的 fork+exec + 文字檔 IPC 正是要消滅的成本來源（§2.4），引入 framework 等於把舊瓶頸搬進新架構 | (a) in-process 重建「一次取整張表」快取：待 config/status layer 查詢成本量測後若有需要再議，但不得以檔案為載體。(b) framework subagent 走 `ies_uri_handle_client`：明確禁止 |
+| D16 | **不修 `8691.602`→`8691.603` 的 endOfMibView 缺陷**；基線改以**分段 scoped walk** 取得 | 該缺陷屬 mainline 既有問題，修它不在 Plan E 範圍。以各子樹 root 分別 walk 即可取得完整基線，成本低且對等 | 於 Phase 0 修掉 mainline 缺陷：範圍外，且會把 Plan E 的時程綁在一個無關的既有 bug 上 |
 
 ---
 
 ## 12. 待決事項與 Future Works
 
-### 12.1 待實測決定
+### 12.1 待實測決定（**阻擋實作**）
 
 | 項目 | 說明 |
 |---|---|
-| framework subagent 的批次取值 | value-file 的「一次取整張表」語意是否需要在 in-process 重現。取決於 config/status layer 單次查詢成本 |
-| 483 筆溢出的關閉方式 | ISS 端不註冊（優先）vs VACM exclude（備案），逐段評估 |
 | `mxArpdb` 的 `URI_FIXED_VALUE` | `ies_auto_mibs_setup_net_mxArpdb.c` 對 `iss_build==1` 的 entry 設了 `URI_FIXED_VALUE`，但該旗標只在 `entry_handle_generate_uri_value_file()`（framework path，`:2425`）被檢查，ISS path 不看。疑似 dead code 或路由不符預期，Phase 5 遷移該組前須確認 |
-| `mxMrp` 的服務者（§9.2） | profile 為 `mxMrp=YES`、`mxMrp.mib` 存在，但找不到註冊 `8691.603.3.12` 的程式。須確認是 ISS 直接提供、尚未實作、或由他處承載。基線未涵蓋此 arc，無法從 walk 判定 |
-| **101 筆「已實作但未宣告」的處置**（§2.6(b)） | RSTP-MIB 的 `dot1dStp` 延伸 74 筆、IP-FORWARD-MIB 13 筆、IP-MIB 14 筆。ISS 依 RFC 實作正確，Moxa 未 ship 該 MIB 模組。**須 RD / PM 決定**：關閉，或補 `.mib` 並加入 product profile |
-| `mxAcl` / `mxVa` 的處置（§2.6(c)、§9.2） | ISS 有完整 MIB-DB 與 Get/Set handler（mxAcl 58–62 個 OID、mxVa 3 個），Moxa 未 ship `.mib`、profile 亦無。同為產品決策。基線未涵蓋此 arc，須先取得完整 walk 確認實際回值 |
 | `mxPhr` / `mxSup` 於其他型號 | 本型號未啟用故無衝突。若某型號啟用了 plugin，需確認 dlmod 與 ISS 兩邊誰服務、是否符合 §4.4 不變式 |
-| 603 walk 提早中止的原因 | mainline 停在 `8691.603.3.2.2.1.1.16.12`（mxRSTP 中途）。屬既有問題，但會阻擋基線重建，須於 Phase 0 排除 |
-| 逐型號重跑 §9.2 比對 | §9.2 的歸屬表依 MDS-G4000-L3-4XGS 組態判定。dlmod 載入清單由 `BR2_PACKAGE_PLUGIN_MOXA_*` 決定，換型號可能使某些 ISS root 失去本地覆蓋。每個出貨型號都要重跑一次比對並記錄結果 |
+
+### 12.1.1 延後至收尾階段（**不阻擋實作**）
+
+以下項目性質上都是「先把 Plan E 做出來，最後再修剪」，不影響架構決策，
+一律排在最終 phase 處理：
+
+| 項目 | 說明 |
+|---|---|
+| 溢出 OID 的修剪 | 比 NOS7 walk 多出的部分（§2.6）最後再處理。ISS 端不註冊（優先）vs VACM exclude（備案） |
+| 101 筆「已實作但未宣告」的處置（§2.6(b)） | RSTP-MIB 的 `dot1dStp` 延伸 74 筆、IP-FORWARD-MIB 13 筆、IP-MIB 14 筆。ISS 依 RFC 實作正確，Moxa 未 ship 該 MIB 模組。屬 RD / PM 決策，與上一項一併處理 |
+| `mxAcl` / `mxVa` 的處置（§2.6(c)、§9.2） | ISS 有完整 MIB-DB 與 Get/Set handler（mxAcl 58–62 個 OID、mxVa 3 個），Moxa 未 ship `.mib`、profile 亦無。同上 |
+| 逐型號重跑 §9.2 比對 | §9.2 的歸屬表依 MDS-G4000-L3-4XGS 組態判定；dlmod 載入清單由 `BR2_PACKAGE_PLUGIN_MOXA_*` 決定，換型號可能使某些 ISS root 失去本地覆蓋。**實作完成後再逐型號處理** |
 
 ### 12.2 Future Works
 
@@ -1062,4 +1073,5 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
   導致整個 `8691.603.*`（ISS 供應的 Moxa 私有 MIB，本型號 profile 中有數十個
   `=YES` 項目）**無法經由正常 walk 取得**；必須以 `8691.603` 為根另跑才看得到。
   mainline 與 Plan C 行為一致，為既有缺陷。
-  影響超出 Plan E 範圍（NMS 全樹輪詢會漏資料），但**阻擋基線建立，故列為 Phase 0 前置**
+  影響超出 Plan E 範圍（NMS 全樹輪詢會漏資料）。
+  **本專案不修**（D16）——基線改以各子樹 root 分段 walk 取得即可，見 §10.1.1
