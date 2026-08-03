@@ -17,10 +17,14 @@
 
 ### 1.2 核心命題
 
+> 決策依據：D2、D12
+
 > **SNMP GET 一律離開 snmpd，交給 AgentX subagent；SNMP SET 一律留在 in-master。**
 > **唯一例外：值本來就在 snmpd 進程內、不需出 process 的 OID，GET 也留在 in-master。**
 
 ### 1.3 本次不做
+
+> 決策依據：D13
 
 - SET 路徑的任何改動
 - SNMP trap 路徑（維持 MQTT → `app_moxa_trap_notification` → `/bin/snmptrap`）
@@ -302,6 +306,8 @@ probe 的存在與否是每張表的偶然性質，硬編碼 C 陣列目前僅 4
 
 ### 4.1 歸屬三分法
 
+> 決策依據：D2（GET 一律出 snmpd）、D12（snmpEngine 移除）
+
 | 桶 | GET | SET | 內容 | 量 |
 |---|---|---|---|---|
 | **A** | ISS AgentX | in-master | `iss_build==1` 全部（不分 RO/RW）+ 新建 mxLa / mxVlan / mxLldp wrapper | 1391 |
@@ -314,6 +320,8 @@ Phase 8 改為收進 `__entryGetValueFunctionTable`）。
 `1.3.6.1.6.3.10` snmpEngine 4 筆**移除**，交還 net-snmp 原生模組（見 §8.3）。
 
 ### 4.2 機制一：整段 OID 註冊
+
+> 決策依據：D3
 
 in-master 對每個遷移中的 MIB 改用**整段註冊**（FRR `register_mib` 風格；
 表用 `netsnmp_register_table_iterator2`），取代現行逐欄位 `netsnmp_register_handler`。
@@ -329,6 +337,8 @@ priority 再相同就會 `MIB_DUPLICATE_REGISTRATION`，後註冊者失敗。**�
 但 priority 只解決 namelen 相同的情形，**不足以保護 in-master**，見 §4.4。
 
 ### 4.3 機制二：`->children` 鏈轉發（取代 probe-OID）
+
+> 決策依據：D4（走 children 鏈）、D4a（接受 net-snmp 內部結構耦合）
 
 #### 註冊表的實際形狀
 
@@ -392,6 +402,8 @@ mox_snmp_forward_get_to_subagent(netsnmp_agent_request_info *reqinfo,
 
 #### `agentx_owned.list` 廢除
 
+> 決策依據：D1
+
 路由變成結構性的：整段註冊 + 無條件 GET 轉發。不再有清單要維護，也不會有
 「清單與 ISS 實際註冊不同步」的問題。**額外好處**：subagent 斷線時 `c == NULL`，
 自動回落本地 value-file 路徑（現況是 RO OID 直接從 MIB 樹上消失）。
@@ -409,6 +421,8 @@ in-master 註冊範圍與 subagent root 一致，轉發回來的 OID 必在同�
 **驗收要求**：機制二完成時必須做 snmpwalk 與 NOS mainline 交叉比對，確認 walk 結果一致。
 
 ### 4.4 多 subagent 的註冊不變式
+
+> 決策依據：D4b
 
 未來若有第三個 daemon 註冊為 AgentX subagent（PDF 規劃過 fiber_check / lldp / dhcp_snp），
 **priority 不是關鍵，`namelen` 才是**。排序鍵是 (`namelen` 由長到短, `priority` 由小到大)，
@@ -492,6 +506,8 @@ in-master 掛一個監聽器，收到 AgentX 註冊時檢查自身是否有等�
 
 ### 5.2 `lib_moxa_snmp_agentx`：封裝邊界而非 API 糖
 
+> 決策依據：D6
+
 `agent/Makefile.in:141` 是 `LMIBOBJS = $(mibgroup_list_lo) mib_modules.lo auto_nlist.lo`
 —— **所有 mibgroup 都進 `libnetsnmpmibs`**，其中就包含 ies-auto-mibs 本身
 （連同 parson / `lib_moxa_framework_uri` / `lib_moxa_system` / ISS remap 的相依）。
@@ -513,6 +529,8 @@ Moxa 若照抄，等於把整個 ies-auto-mibs 拖進 framework 進程。
 `agentx/subagent`（加了對 snmpd 無害，subagent 模式由執行期 `-X` 旗標啟用）。
 
 ### 5.3 framework subagent 的進程內整合
+
+> 決策依據：D5
 
 比照 FRR（`~/SRC/frr/lib/agentx.c`）：
 
@@ -576,6 +594,8 @@ SET PDU → in-master handler → MODE_IS_SET
 
 ### 6.3 身分與權限
 
+> 決策依據：D7
+
 > **GET**：VACM 在 master 把關 → 轉發 subagent → subagent **無身分**讀取，回值。
 > **SET**：完全不動，`security_token` / per-user token / 權限模型全保留。
 
@@ -622,6 +642,8 @@ ISS GET path 一次都沒引用。
 
 ### 7.2 value-file 的處置
 
+> 決策依據：D10
+
 | 對象 | 處置 |
 |---|---|
 | `ies_uri_handle_client` | **保留不動**。19+ 個使用者（`app_moxa_iss_config_loader`、`lib_moxa_rust_iss`、多支 plugin 的 `framework/src/command.rs`、python command script…），大多與 SNMP 無關 |
@@ -634,6 +656,8 @@ ISS GET path 一次都沒引用。
 ## 8. dlmod 的處置
 
 ### 8.1 GET 遷移，SET 留在 `.so`
+
+> 決策依據：D8、D9（`ucd-snmp/dlmod` 模組本身保留）
 
 dlmod plugin 對 framework 的呼叫統計：`/api/v1/setting` 321 次、`/api/v1/status` 162 次、
 `/api/v1/command` 3 次，全部經 `lib_moxa_snmp_plugin.c:144` 的
@@ -671,6 +695,8 @@ Phase 7 拆分時這類共用 arc 要一起處理，不能各自為政。
 
 ### 8.3 解法：同一份原始碼編兩次
 
+> 決策依據：D8
+
 因為 framework subagent **內嵌 libnetsnmpagent**，`lib_moxa_snmp_plugin` 與 plugin `.c`
 使用的 net-snmp 型別（`netsnmp_variable_list`、`snmp_set_var_typed_value`、handler 註冊）
 在 framework 進程中**是存在的**，程式碼可幾乎原樣編入。需換掉的只有兩處：
@@ -697,6 +723,8 @@ Phase 7 拆分時這類共用 arc 要一起處理，不能各自為政。
 ## 9. ISS 側工作
 
 ### 9.1 補三組 wrapper
+
+> 決策依據：D11
 
 `iss_build==1` 但 ISS 端無對應 Moxa MIB 的只有 3 組：`mxLadb`、`mx_vlan`、`mx_lldp`
 ——正好就是唯一帶 `ISS_REMAP_TBL` / `ISS_REMAP_MERGE_TABLE` 旗標的群組
@@ -916,6 +944,8 @@ master 靠「namelen 長者勝」仲裁，**不是靠 priority**。這正是 Pla
 
 ### 10.2 Phase 分解
 
+> 決策依據：D14
+
 策略是「**試點 → benchmark 決策點 → 全量**」，不是逐步推進。
 
 | Phase | 內容 | go/no-go |
@@ -940,6 +970,38 @@ Phase 5 完成後 ISS 側 1391 筆成果落地。framework 那半邊（Phase 3�
 ---
 
 ## 11. 決策日誌
+
+**編號規則**
+
+- `D` = Decision。編號依決策**拍板的先後順序**，非重要性排序
+- `a` / `b` 後綴為同一母決策的子決策（目前只有 D4 系列）：拆開是為了讓每一項能被各自引用與推翻
+- **編號一旦給出即不重用**。決策被推翻時新增一列並註明「取代 Dn」，不改寫或回收舊編號
+
+**使用方式**
+
+各章節開頭以 `> 決策依據：Dn` 標注其依據；commit message 可寫 `implements D3`、
+程式碼註解可寫 `/* per D4b: ... */`，不必複述理由。
+依專案規範，本表是「為什麼做 X」的唯一真相來源，不依賴對話記憶。
+
+**反向索引**
+
+| 決策 | 對應章節 |
+|---|---|
+| D1 | §4.3「`agentx_owned.list` 廢除」 |
+| D2 | §1.2、§4.1 |
+| D3 | §4.2 |
+| D4、D4a | §4.3 |
+| D4b | §4.4 |
+| D5 | §5.3 |
+| D6 | §5.2 |
+| D7 | §6.3 |
+| D8 | §8.1、§8.3 |
+| D9 | §8.1 |
+| D10 | §7.2 |
+| D11 | §9.1 |
+| D12 | §1.2、§4.1 |
+| D13 | §1.3 |
+| D14 | §10.2 |
 
 | # | 決策 | 理由 | 被否決的方案與原因 |
 |---|---|---|---|
