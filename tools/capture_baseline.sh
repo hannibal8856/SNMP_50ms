@@ -39,18 +39,35 @@ mkdir -p "$OUT"
 rc=0
 for root in "${ROOTS[@]}"; do
     f="${OUT}/${root}.txt"
+    e="${OUT}/${root}.err"
     echo "walking ${root} ..."
-    "$SNMPWALK" -v2c -c "$COMM" -On -Cc "$HOST" "$root" > "$f" 2>&1
+    # stderr must NOT be merged into $f. snmpwalk writes its error text the
+    # moment it happens, which lands mid-line in the OID stream and splits one
+    # OID across two lines; neither half then matches walkdiff's OID pattern,
+    # so a present OID is reported missing. Observed 2026-08-04 on 8691.603
+    # column 13 port 9, which cost an investigation.
+    "$SNMPWALK" -v2c -c "$COMM" -On -Cc "$HOST" "$root" > "$f" 2> "$e"
     walk_rc=$?
-    n=$(grep -c "^\." "$f" 2>/dev/null)
-    if [ "$walk_rc" -ne 0 ]; then
-        echo "  !! ${root}: snmpwalk 失敗（exit ${walk_rc}）—— 此次擷取無效" >&2
-        rc=1
-    elif grep -qE "Timeout: No Response|Traceback \(most recent call last\)|^snmpwalk: " "$f"; then
-        echo "  !! ${root}: 擷取中出現錯誤訊息 —— 此次擷取無效" >&2
-        rc=1
-    elif [ "$n" -eq 0 ]; then
-        echo "  -- ${root}: 0 OIDs（此裝置未實作此子樹）"
+    n=$(grep -c "^\." "$f")
+    err=""
+    if [ -s "$e" ]; then
+        err="  <- $(head -1 "$e")"
+    fi
+
+    # A scoped walk can exit non-zero after producing a complete, error-free
+    # capture, so the exit status alone does not condemn it. Judge on content.
+    if [ "$n" -eq 0 ]; then
+        if [ "$walk_rc" -ne 0 ] || [ -s "$e" ]; then
+            echo "  !! ${root}: 0 OIDs 且 snmpwalk 報錯（exit ${walk_rc}）—— 此次擷取無效${err}" >&2
+            rc=1
+        else
+            echo "  -- ${root}: 0 OIDs（此裝置未實作此子樹）"
+        fi
+    elif [ -s "$e" ]; then
+        # 8691.602 and 8691.603 abort mid-walk on mainline too - a known device
+        # limitation, not a capture failure. The OIDs already collected are
+        # usable; only the reach of the walk is in doubt.
+        echo "  ~~ ${root}: ${n} OIDs，但走到一半中止 —— 內容可用，涵蓋範圍可能不完整${err}"
     else
         echo "  ok ${root}: ${n} OIDs"
     fi
