@@ -1,0 +1,50 @@
+RESULT-task3.txt - acceptance evidence for Task 3 (children-chain GET forwarding)
+=================================================================================
+Plan:  plan-e-phase0-1-PLAN-2026-08-03.md, Task 3, Steps 6 and 7
+Build: 3rdparty_net_snmp 655ba95..aa598f7 (incl. 2ed5f03 synthetic-index fix
+       and aa598f7 forward-at-the-local/remote-boundary fix)
+DUT:   192.168.127.253, partition 1 = Plan E, partition 2 = NOS 7.0 mainline
+Date:  2026-08-04
+
+STEP 6 - no OID may disappear versus mainline
+---------------------------------------------
+Compared (operator's captures, same walk options, both re-read 2026-08-04):
+  mainline : snmpwalk/snmpwalk-NOS7-2026_0713_1621-1.3.6.1.2-20260804.txt
+  Plan E   : snmpwalk/snmpwalk-plan-E2-2026_0804_1331-1.3.6.1.2.txt
+
+  $ python3 tools/walkdiff.py <mainline> <planE>
+mainline=1817 planE=2609 missing=0 surplus=792 value_differs=60
+
+  PASS. missing=0 - no standard-tree OID was lost.
+  Confirmed independently by the operator with meld on the same two files.
+
+  1.3.6.1.4 is deliberately NOT judged yet: the framework subagent does not
+  exist, so the Moxa private tree cannot be at its final shape. Re-run this
+  comparison when it lands.
+
+  An earlier run against snmpwalk/mainline-20260804_0318/ showed missing=4.
+  Those four are one dot1qVlanCurrentTable row (VLAN 222, timemark 1600) whose
+  dot1qVlanStatus is 2 = dynamicGvrp - a dynamic VLAN present at 03:18 and gone
+  at 13:53, ten hours and a reboot apart. Not a Plan E gap.
+
+STEP 7 - forwarding must actually be in effect
+----------------------------------------------
+Measured on the wire, not with a client-side stopwatch. 216 request/response
+pairs matched by snmp.request_id from
+/home/moxa/pcap/2026-08-04_plan-E2_2026_0804_1331.pcapng (test_snmp_get_loop.sh):
+
+  group                  n     p50        p100
+  ifOperStatus           72    2.9 ms     3.8 ms
+  ifInOctets/ifInErrors  72    5.8 ms    12.9 ms
+  fiberCheck Tx/Rx       72   11.0 ms    45.1 ms
+  all                   216    5.8 ms    45.1 ms
+
+  PASS. The plan's criterion is ifOperStatus p100 < 50 ms; measured 3.8 ms.
+  Mainline for the same request costs ~600 ms.
+
+  NOTE ON METHOD: the plan's Step 7 command wraps snmpget in /usr/bin/time,
+  which measures the client process - fork/exec plus net-snmp MIB file parsing
+  alone costs ~40 ms, so that command largely benchmarks the PC and would have
+  sat right on its own 50 ms threshold regardless of the device. A client-side
+  wall-clock loop gave p50 46 ms / p100 77 ms for the same device that answers
+  in 2.9 ms on the wire. Use the pcap, or the device's own util_timeDiff.
