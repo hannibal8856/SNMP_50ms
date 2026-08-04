@@ -665,16 +665,67 @@ subagent 都不可能提供，轉發過去只會拿到錯的東西或空值：
 | 條件 | 實測後果 |
 |---|---|
 | `SYNTHETIC_INDEX`（合成 index） | `8691.603.3.2.2.1.1.1.*` 整欄消失（已修，commit `2ed5f03`） |
-| `GENERATE_SYS_OID` | **`sysObjectID` 回 `.1.3.6.1.2.1` 而非 `.1.3.6.1.4.1.8691.600.1.5.4`** —— 對 NMS 而言這台機器不再是 Moxa 產品（未修） |
-| `URI_FIXED_VALUE` | 未觀察到，但同類 |
-| `ChkEntryGetValue() == 0`（Path 1） | 未出事純屬運氣——framework subagent 尚未存在、ISS 未覆蓋其 arc |
+| `GENERATE_SYS_OID` | **`sysObjectID` 回 `.1.3.6.1.2.1` 而非 `.1.3.6.1.4.1.8691.600.1.5.4`** —— 對 NMS 而言這台機器不再是 Moxa 產品（已修，commit `aa598f7`） |
+| `URI_FIXED_VALUE` | 未觀察到，但同類（已修，同上） |
+| `ChkEntryGetValue() == 0`（Path 1） | 未出事純屬運氣——framework subagent 尚未存在、ISS 未覆蓋其 arc（已修，同上） |
 
-**根本問題是順序**：目前轉發發生在 `moxaSnmpHandle_ChkEntryGetValue()` 等本地取值檢查**之前**，
+**根本問題是順序**：轉發原本發生在 `moxaSnmpHandle_ChkEntryGetValue()` 等本地取值檢查**之前**，
 所以上述四類都被繞過。
 
 **正解不是逐一列舉旗標，而是把轉發移到本地取值檢查之後**——讓「本地算得出來的就本地算」
 成為結構性保證，而不是一份後人要記得擴充的清單。逐一列舉的作法已經失敗過一次：
 `SYNTHETIC_INDEX` 修好之後，`GENERATE_SYS_OID` 立刻在同一個位置以同樣的方式出錯。
+
+#### 7.0.1 實作位置（commit `aa598f7`）
+
+「本地取值檢查」不在同一層，這是實作時才浮現的事實：
+
+| 本地產值者 | 原始位置 |
+|---|---|
+| Path 1 callback | `mox_snmp_handle_entry()` 內 |
+| `GENERATE_SYS_OID` | `entry_handle_generate_iss_value_file()` **內部**第一個分支 |
+| `URI_FIXED_VALUE` | `entry_handle_generate_uri_value_file()` **內部**第一個分支 |
+
+因此轉發不能留在 `mox_snmp_handle_entry()` 頂端——它看不到後兩者。轉發改放進兩個
+generate 函式，在本地產值分支的 `else` 裡、**對外呼叫（ISS / framework）之前**。
+
+```
+if ( cache invalid )
+{
+    if ( <local producer flag> )  { ...compute in snmpd... }
+    else
+    {
+        if ( !SYNTHETIC_INDEX && 0 == forward_get_to_subagent() )
+            return IES_GET_FORWARDED;      /* caller answers NOERROR */
+        ...leave the process...
+    }
+}
+```
+
+這樣「本地算得出來的就本地算」是結構性的：日後在上面多加一個本地分支，它自動不會被轉發。
+兩個 generate 函式因此多收 `reginfo/reqinfo/request`，並新增回傳值 `IES_GET_FORWARDED`。
+
+`SYNTHETIC_INDEX` 仍是明示的旗標判斷，因為它**不屬於**「snmpd 自己算得出值」那一類：
+值仍來自 ISS 檔案，但欄位要等本地 `iss_snmp_makeup_index()` 跑完才存在，
+所以任何 subagent 都無法提供。兩者理由不同，不該合併成同一個判斷。
+
+**被拒絕的替代方案**
+
+1. *在 `mox_snmp_handle_entry()` 內用單一 predicate 列出三個旗標* ——
+   最小改動，但本質仍是一份清單，正是 §7.0 判定失敗過一次的作法。
+2. *把 `GENERATE_SYS_OID` / `URI_FIXED_VALUE` 上提到 `mox_snmp_handle_entry()`* ——
+   完全符合「在 `mox_snmp_handle_entry` 內」的字面要求，但 `URI_FIXED_VALUE`
+   與遠端路徑共用 uri 函式後段約 90 行的 value-file 寫檔尾段，得先把它抽成共用 helper，
+   改動落在每個非轉發 GET 的熱路徑上，風險與收益不成比例。
+
+**已知副作用**（轉發移到 cache 檢查之後才發生）
+
+- 每次轉發前會多跑 `unlink(fname)` 與 `util_table_snapshot_reset()`。
+  `unlink` 清掉可能過期的本地 value-file，方向是安全的；
+  `reset` 在「轉發表與本地表交錯」的 walk 中可能多一次 ISS 重讀。
+  同一張表的所有欄位旗標相同（全轉發或全本地），故影響僅落在表與表之間。
+- 若某張表的 snapshot 仍在 800ms 窗內，該次 GET 會用 snapshot 而不轉發。
+  只有在先發生過本地 fallback 時才可能出現，且 800ms 後自癒。
 
 ### 7.1 桶 A 不需要搬語意
 
