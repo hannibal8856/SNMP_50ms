@@ -243,6 +243,26 @@ for i in 0..max_port_num_of_switch as usize {
 
 ### 2.3 方案 C:fiber_check daemon 變 AgentX subagent(長期,跟 ~/agentx_multi.md 階段 2 PoC 對接)
 
+> ## ⏸ PENDING(2026-08-04 決議)
+>
+> **fiber_check application 暫時不會成為 AgentX subagent。本節以下的設計與工期估算
+> 保留作參考,但不是目前的行動項目,不要據此排工。**
+>
+> 依據 `~/WORK/SNMP_50ms/plan-e-agentx-get-offload-design-2026-08-03.md`:
+>
+> - §4.4 只把 fiber_check 列為「**未來若有**第三個 daemon 註冊為 AgentX subagent
+>   (PDF 規劃過 fiber_check / lldp / dhcp_snp)」的假設情境,用來論證 namelen 不變式;
+>   Phase 0–8 的實際範圍裡**沒有** fiber_check daemon 變 subagent 這件事。
+> - fiber_check 在 Plan E 的定位是 **Phase 7「dlmod GET 遷移」**:把 SNMP GET 從
+>   dlmod plugin 導到 framework subagent。該 Phase 的 go/no-go 條件明列
+>   「**fiber_check 延遲改善量測**」。
+>
+> **所以正確的順序是:等 Plan E Phase 7 把 fiber check 的 SNMP GET 導到 framework
+> 之後再量測**,用當時的實測數字決定 fiber_check 還需不需要自己變 subagent。在那之前
+> 本節的 ~50 µs / ~300x 都只是估算,沒有實測支撐。
+>
+> 量測前的基線見 §8。
+
 #### 設計
 
 從 ~/agentx_multi.md 階段 2 PoC:fiber_check daemon 用 `lib_moxa_agentx` 變 subagent,自己 own `.1.3.6.1.4.1.8691.603.5.3.2.*`(status OID)。
@@ -324,6 +344,14 @@ GET fiberCheckStatRxPower.X 進來:
 
 **A + C 是主路線**。B 只在實測發現 A 的同步延遲是瓶頸時補上。
 
+> **本節已失效,見 §7.4 與 §2.3 的 PENDING 標註(2026-08-04)。**現行排序是:
+>
+> | # | 方案 | 狀態 |
+> |---|---|---|
+> | 1 | **A** | 已上線,但有 cross-process 缺陷 → 見 §7 |
+> | 2 | **B**(既有 status SHM 加 `mIsPortLinkUp[]`)| **進行中** —— 不是 optional 加速,是修 A 的必要工作 |
+> | 3 | C(fiber_check 變 AgentX subagent)| **⏸ PENDING** —— 不在 Plan E 範圍內;等 Phase 7 把 SNMP GET 導到 framework 後量測再決定 |
+
 ---
 
 ## 4. 對 ~/agentx_multi.md 階段 2 PoC 的延伸啟示
@@ -340,6 +368,12 @@ GET fiberCheckStatRxPower.X 進來:
 → **方案 C 不是「額外」工作,本來就在階段 2 PoC 範圍內**。順序上:
 1. PoC 起跑前 / 過程中,先做方案 A(獨立,半天)— 立即 production 受惠
 2. PoC 內把 fiber_check daemon 改 subagent — 自然取代 A,SNMP 路徑大幅改善
+
+> **已失效(2026-08-04)**:上面這句「本來就在階段 2 PoC 範圍內」是根據
+> `~/agentx_multi.md` 的舊規劃寫的。現行的
+> `plan-e-agentx-get-offload-design-2026-08-03.md` 沒有把 fiber_check daemon 變
+> subagent 列入 Phase 0–8;§4.4 只把它當「未來若有第三個 daemon」的假設情境。
+> 表格裡那四條原則本身仍成立,但**不構成現在要做 C 的理由**。見 §2.3 的 PENDING 標註。
 
 ---
 
@@ -482,13 +516,28 @@ rxPower。
 
 採用:把 link status 放進**既有**的 status SHM。
 
-1. `include/fiber_check_monitor.h:21` `struct FiberCheckPortStatus` 加 `bool mLinkUp`
-2. daemon 在 `fiber_check_main.c:444`(ISS event)、`:961`(startup init)更新
-   `gIsPortLinkUp[]` 的同時寫進 SHM
+1. `include/fiber_check_monitor.h` `struct FiberCheckStatus` 加
+   `bool mIsPortLinkUp[LIB_SYSTEM_DEF_MAX_PORT_NUM_IN_SYSTEM]`
+2. daemon 在 `fiber_check_main.c`(ISS event / startup init)改呼叫
+   `FiberCheckMntr_SetPortLinkUp()`,由它寫 `gFiberCheckStatus` 並 flush SHM
 3. `fiber_check_shm_api.c:_OutputStatus()` 改讀
-   `aFiberCheckStatus->mPortStatus[port].mLinkUp`;`gIsPortLinkUp[]` 與
+   `aFiberCheckStatus->mIsPortLinkUp[port]`;`gIsPortLinkUp[]` 與
    `FiberCheck_IsPortLinkUp()` 連同 `630a991` 搬家的那段一併移除
 4. `status.rs` **不動**(它讀 `.stat` 的介面不變)
+
+> **實作時的設計修正(2026-08-04)**:第 1 點原本寫的是「在
+> `struct FiberCheckPortStatus` 加 `bool mLinkUp`」,實作時改為在
+> `struct FiberCheckStatus` 內另開平行陣列。原因是讀完 `fiber_check_monitor.c`
+> 才發現 `_ResetFiberDdmStatus()`(:80)與 DDM 更新(:219)兩處都是
+> `memcpy(&gFiberCheckStatus.mPortStatus[aPortNo], &tmpStatus, ...)` 整個 port
+> struct 覆寫 —— per-port 欄位會被每次 DDM refresh 與每次 SFP 移除 reset 清掉。
+> 而且 link 狀態本來就跟 SFP 在不在無關,必須活過 SFP 移除。平行陣列讓這兩條既有
+> 路徑完全不用動,也不留下「未來新增寫入路徑要記得保留 mLinkUp」的地雷。
+>
+> 連帶:`FiberCheckMntr_Main()` 起始的 `_InitSystemParameter()` 原本
+> `memset(&gFiberCheckStatus, 0, sizeof(...))` 會清掉 link 狀態,而它跟 main task 的
+> `_InitPortLinkStatus()` 是並行跑的。改成只 memset `mPortStatus` 成員,語意也更
+> 精確(它本來就只負責 DDM 狀態初始化)。
 
 副作用:同步變即時,§2.1 原本擔心的 dump 落後問題連同「dump 週期」這個錯誤前提一起消失。
 
@@ -531,6 +580,56 @@ grep -E '^(linkStatus|rxPower)\.0=' /etc/moxa/app-moxa-fiber-check/fiberCheck.st
 cross-process 問題。B 是 C 落地前的過渡,兩者不衝突;C 上線後 `_OutputStatus()` 仍
 保留給 REST/web UI 用。
 
+**補充(2026-08-04)**:C 已標為 PENDING(§2.3),不在 Plan E 範圍內。這反過來讓 B
+變成**唯一**會落地的修法 —— 原本「B 只是 C 之前的過渡」的說法不再成立,B 就是終局。
+
+---
+
+## 8. 量測基線(2026-08-04,Plan E2 build,Plan B 尚未上線)
+
+Plan E Phase 7 把 fiber check 的 SNMP GET 導到 framework 之後要重新量測(§2.3),
+以下是**導入前**的基線,供屆時對比。
+
+來源:`~/pcap/2026-08-04_plan-E2_2026_0804_0824.pcapng`(17340 packets,1h52m,
+DUT 192.168.127.253)。
+
+**重要前提:`...1.1.1.8`(txPower)與 `...1.1.1.9`(rxPower)在這份 capture 裡從未被
+分開查詢** —— 2640 個 request 全部是 2-varbind GET,同時帶兩個 column 的同一個 port,
+共用一次 round trip。無法分別給出兩個 OID 各自的 latency。
+
+| 指標 | 值 |
+|---|---|
+| n(request/response pair) | 2640(全部配對成功,無遺漏) |
+| mean | **12.49 ms** |
+| median | 10.73 ms |
+| p90 / p95 / p99 | 14.53 / 27.81 / 30.56 ms |
+| min | 10.25 ms |
+| **worst case** | **47.60 ms** |
+| stdev | 5.14 ms |
+| **> 50 ms** | **0 / 2640(0.000%)** |
+| > 40 ms | 4(0.152%) |
+| > 30 ms | 30(1.136%) |
+
+分布是雙峰的,原因是 `status.rs::get_cache_timeout_in_second()` 回傳 **5 秒**,而輪詢
+週期是 ~30.6 秒:
+
+| 樣本 | n | mean | max |
+|---|---|---|---|
+| 每輪第一個 request(cache miss) | 220 | **28.59 ms** | 47.60 ms |
+| 同輪其餘 11 個(cache hit) | 2420 | **11.02 ms** | 45.45 ms |
+
+輪詢形態:220 輪 × 12 port(port 1→12),輪內耗時 0.183 s,輪間隔 ~30.6 s。每輪第一發
+必定 cache 過期,要重跑 `output_shared_info()`(讀 SHM + 寫 205 行 `.stat`)加 INI 解析
+與整張 portTable 組裝;差值約 **17.6 ms** 就是這一整套的成本。(此因果是從資料形狀 +
+程式碼推得,非直接量測;要坐實可把輪詢間隔改成 < 5 s 再抓一份,預期雙峰消失。)
+
+**判讀**:
+
+- 50 ms 目前有過,但餘裕僅 2.4 ms,且 worst case 全部落在 cache-miss 那一發。NMS 若改用
+  低頻輪詢(每次都 miss),平均會從 12.5 ms 升到 ~28.6 ms,尾巴會很危險。
+- 11 ms 的地板是 framework REST 這層的固定成本。**方案 B 不會改變它**(B 修的是正確性),
+  屆時 Phase 7 的量測要比的是這個地板。
+
 ---
 
 ## Changelog
@@ -541,3 +640,8 @@ cross-process 問題。B 是 C 落地前的過渡,兩者不衝突;C 上線後 `_
   跑在 framework process,導致 `fiberCheckStatRxPower` 恆為 "N/A"(regression)。
   查證 ISS 無 SHM ABI 相依。B 改為必要工作,範圍縮小為「既有 status SHM 加
   `bool mLinkUp`」。詳見 §7。
+- 2026-08-04:B 實作完成(未建置驗證),設計改為平行陣列 `mIsPortLinkUp[]`,理由見
+  §7.4。**方案 C 標為 PENDING**(§2.3)—— 依
+  `plan-e-agentx-get-offload-design-2026-08-03.md`,fiber_check 不會成為 AgentX
+  subagent,而是走 Phase 7「dlmod GET 遷移」導到 framework,屆時再量測決定。
+  新增 §8 記錄導入前的 latency 基線(mean 12.49 ms / worst 47.60 ms / 無 >50 ms)。
