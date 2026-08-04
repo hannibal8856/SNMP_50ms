@@ -657,6 +657,25 @@ framework subagent 必須原樣重現，否則值會變。這是遷移的**驗�
 75 個 `REPLACE_TRUTH_VALUE` 幾乎全在 `mx_event_*`（port 30、switching 15、
 turboring_v2 6、routing 5、dhcpSrv 4、portmirror 4…），實作上是**一條規則不是 75 條**。
 
+### 7.0 本地能算出的值不得轉發（實測補記 2026-08-04）
+
+D2 寫「GET 一律轉發」，實測證明**開得太寬**。凡是 snmpd 自己算得出來的值，
+subagent 都不可能提供，轉發過去只會拿到錯的東西或空值：
+
+| 條件 | 實測後果 |
+|---|---|
+| `SYNTHETIC_INDEX`（合成 index） | `8691.603.3.2.2.1.1.1.*` 整欄消失（已修，commit `2ed5f03`） |
+| `GENERATE_SYS_OID` | **`sysObjectID` 回 `.1.3.6.1.2.1` 而非 `.1.3.6.1.4.1.8691.600.1.5.4`** —— 對 NMS 而言這台機器不再是 Moxa 產品（未修） |
+| `URI_FIXED_VALUE` | 未觀察到，但同類 |
+| `ChkEntryGetValue() == 0`（Path 1） | 未出事純屬運氣——framework subagent 尚未存在、ISS 未覆蓋其 arc |
+
+**根本問題是順序**：目前轉發發生在 `moxaSnmpHandle_ChkEntryGetValue()` 等本地取值檢查**之前**，
+所以上述四類都被繞過。
+
+**正解不是逐一列舉旗標，而是把轉發移到本地取值檢查之後**——讓「本地算得出來的就本地算」
+成為結構性保證，而不是一份後人要記得擴充的清單。逐一列舉的作法已經失敗過一次：
+`SYNTHETIC_INDEX` 修好之後，`GENERATE_SYS_OID` 立刻在同一個位置以同樣的方式出錯。
+
 ### 7.1 桶 A 不需要搬語意
 
 ISS GET path（`entry_handle_generate_iss_value_file`，`ies_auto_mibs.c:2182-2369`
